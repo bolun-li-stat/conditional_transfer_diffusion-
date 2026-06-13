@@ -14,7 +14,7 @@ CovarianceScenario = Literal["shared", "mismatch"]
 
 @dataclass
 class DiffusionConfig:
-    T: int = 200
+    T: int = 500
     beta_start: float = 1e-4
     beta_end: float = 2e-2
     variance_type: VarianceType = "posterior"
@@ -49,7 +49,7 @@ class TrainingConfig:
     validation_interval: int = 500
     checkpoint_interval: int = 2_000
     save_checkpoints: bool = True
-    resume_from_checkpoint: bool = True
+    resume_from_checkpoint: bool = False
     sampling_mode: SamplingMode = "balanced"
     device: str = "auto"
     num_workers: int = 0
@@ -71,7 +71,7 @@ class ExperimentConfig:
     n: int | None = None
     n_target_train: int | None = 100
     n_aux_train: int | None = 1_000
-    results_dir: Path = Path("results")
+    results_dir: Path = Path("results_T500")
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
