@@ -66,6 +66,10 @@ def common_setting_id(cfg: ExperimentConfig) -> str:
         cfg.n_target_train,
         cfg.n_aux_train,
         cfg.seed,
+        cfg.diffusion.T,
+        cfg.diffusion.beta_start,
+        cfg.diffusion.beta_end,
+        cfg.diffusion.variance_type,
         cfg.training.sampling_mode,
         cfg.training.training_steps,
     ])
@@ -273,7 +277,7 @@ def build_cli_configs(args: argparse.Namespace) -> list[ExperimentConfig]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment", choices=["smoke", "low_target_data", "same_total_budget", "all"], default="smoke")
-    parser.add_argument("--results-dir", default="results")
+    parser.add_argument("--results-dir", default="results_T500")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--sampling-mode", choices=["balanced", "natural"], default="balanced")
     parser.add_argument("--training-steps", type=int, default=None)
