@@ -14,7 +14,7 @@ CovarianceScenario = Literal["shared", "mismatch"]
 
 @dataclass
 class DiffusionConfig:
-    T: int = 500
+    T: int = 1000
     beta_start: float = 1e-4
     beta_end: float = 2e-2
     variance_type: VarianceType = "posterior"
@@ -23,14 +23,15 @@ class DiffusionConfig:
 @dataclass
 class DataConfig:
     d: int = 100
-    K: int = 8
+    K: int = 3
     Delta: float = 20.0
     target_class: int = 1
     min_pairwise_mean_distance: float = 15.0
-    jitter: float = 1e-5
+    jitter: float = 0.0
     covariance_scenario: CovarianceScenario = "shared"
     rho: float | None = 0.2
     mismatch_level: str | None = None
+    class_varying_target_rho: float = 0.1
 
 
 @dataclass
@@ -71,7 +72,7 @@ class ExperimentConfig:
     n: int | None = None
     n_target_train: int | None = 100
     n_aux_train: int | None = 1_000
-    results_dir: Path = Path("results_T500")
+    results_dir: Path = Path("results_T1000_K3")
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -109,8 +110,23 @@ def _to_jsonable(value: Any) -> Any:
     return value
 
 
+def sqrt_alpha_bar_T(diffusion: DiffusionConfig) -> float:
+    import math
+
+    if diffusion.T <= 0:
+        raise ValueError("Diffusion horizon T must be positive.")
+    if diffusion.T == 1:
+        betas = [diffusion.beta_start]
+    else:
+        step = (diffusion.beta_end - diffusion.beta_start) / (diffusion.T - 1)
+        betas = [diffusion.beta_start + i * step for i in range(diffusion.T)]
+    return float(math.sqrt(math.prod(1.0 - beta for beta in betas)))
+
+
 def config_to_dict(config: ExperimentConfig) -> dict[str, Any]:
-    return _to_jsonable(asdict(config))
+    out = _to_jsonable(asdict(config))
+    out["sqrt_alpha_bar_T"] = sqrt_alpha_bar_T(config.diffusion)
+    return out
 
 
 def config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
@@ -148,19 +164,19 @@ def default_smoke_config() -> ExperimentConfig:
 
 
 def default_experiment1_configs(seeds: list[int] | None = None) -> list[ExperimentConfig]:
-    seeds = [0, 1, 2] if seeds is None else seeds
+    seeds = list(range(20)) if seeds is None else seeds
     configs: list[ExperimentConfig] = []
     for seed in seeds:
-        for rho in [0.2, -0.15]:
-            for n_target in [100, 250, 500]:
-                cfg = ExperimentConfig(experiment_type="low_target_data", seed=seed, n_target_train=n_target, n_aux_train=1000)
+        for rho in [0.2, 0.0, -0.2]:
+            for n_target in [200, 500, 800]:
+                cfg = ExperimentConfig(experiment_type="low_target_data", seed=seed, n_target_train=n_target, n_aux_train=n_target)
                 cfg.data.covariance_scenario = "shared"
                 cfg.data.rho = rho
                 cfg.data.mismatch_level = None
                 configs.append(cfg)
         for level in ["0", "mild", "medium", "strong"]:
-            for n_target in [100, 250, 500]:
-                cfg = ExperimentConfig(experiment_type="low_target_data", seed=seed, n_target_train=n_target, n_aux_train=1000)
+            for n_target in [200, 500, 800]:
+                cfg = ExperimentConfig(experiment_type="low_target_data", seed=seed, n_target_train=n_target, n_aux_train=n_target)
                 cfg.data.covariance_scenario = "mismatch"
                 cfg.data.rho = None
                 cfg.data.mismatch_level = level
@@ -169,18 +185,18 @@ def default_experiment1_configs(seeds: list[int] | None = None) -> list[Experime
 
 
 def default_experiment2_configs(seeds: list[int] | None = None) -> list[ExperimentConfig]:
-    seeds = [0, 1, 2] if seeds is None else seeds
+    seeds = list(range(20)) if seeds is None else seeds
     configs: list[ExperimentConfig] = []
     for seed in seeds:
-        for rho in [0.2, -0.15]:
-            for n in [100, 250, 500]:
+        for rho in [0.2, 0.0, -0.2]:
+            for n in [200, 500, 800]:
                 cfg = ExperimentConfig(experiment_type="same_total_budget", seed=seed, n=n, n_target_train=n, n_aux_train=n)
                 cfg.data.covariance_scenario = "shared"
                 cfg.data.rho = rho
                 cfg.data.mismatch_level = None
                 configs.append(cfg)
         for level in ["0", "mild", "medium", "strong"]:
-            for n in [100, 250, 500]:
+            for n in [200, 500, 800]:
                 cfg = ExperimentConfig(experiment_type="same_total_budget", seed=seed, n=n, n_target_train=n, n_aux_train=n)
                 cfg.data.covariance_scenario = "mismatch"
                 cfg.data.rho = None

@@ -26,11 +26,12 @@ class GaussianMixtureSpec:
         return self.target_class - 1
 
 
-def make_ar1_covariance(d: int, rho: float, jitter: float = 1e-5) -> np.ndarray:
+def make_ar1_covariance(d: int, rho: float, jitter: float = 0.0) -> np.ndarray:
     idx = np.arange(d)
     cov = rho ** np.abs(idx[:, None] - idx[None, :])
     cov = cov.astype(np.float64)
-    cov.flat[:: d + 1] += jitter
+    if jitter:
+        cov.flat[:: d + 1] += jitter
     return cov
 
 
@@ -51,18 +52,23 @@ def make_component_means(K: int, d: int, Delta: float, seed: int, min_pairwise_d
     return np.stack(means, axis=0)
 
 
-def _auxiliary_rhos(K: int, mismatch_level: str, seed: int) -> list[float]:
+def _auxiliary_rhos(K: int, mismatch_level: str, seed: int, target_rho: float = 0.1) -> list[float]:
     rng = np.random.default_rng(seed)
+    n_aux = K - 1
     if mismatch_level == "0":
-        return [0.2] * (K - 1)
-    if mismatch_level == "mild":
-        vals = rng.uniform(0.05, 0.35, size=K - 1)
-    elif mismatch_level == "medium":
-        vals = rng.uniform(-0.15, 0.55, size=K - 1)
-    elif mismatch_level == "strong":
-        vals = np.clip(rng.uniform(-0.6, 0.75, size=K - 1), -0.8, 0.8)
-    else:
+        return [float(target_rho)] * n_aux
+    intervals = {
+        "mild": ((-0.10, 0.00), (0.20, 0.30)),
+        "medium": ((-0.30, -0.10), (0.30, 0.50)),
+        "strong": ((-0.55, -0.30), (0.50, 0.75)),
+    }
+    if mismatch_level not in intervals:
         raise ValueError(f"Unknown mismatch_level={mismatch_level!r}")
+    lower, upper = intervals[mismatch_level]
+    n_lower = n_aux // 2
+    n_upper = n_aux - n_lower
+    vals = [*rng.uniform(*lower, size=n_lower), *rng.uniform(*upper, size=n_upper)]
+    rng.shuffle(vals)
     return [float(v) for v in vals]
 
 
@@ -73,7 +79,8 @@ def make_component_covariances(
     rho: float | None,
     mismatch_level: str | None,
     seed: int,
-    jitter: float = 1e-5,
+    jitter: float = 0.0,
+    class_varying_target_rho: float = 0.1,
 ) -> tuple[np.ndarray, list[float]]:
     if scenario == "shared":
         if rho is None:
@@ -81,7 +88,7 @@ def make_component_covariances(
         rhos = [float(rho)] * K
     elif scenario == "mismatch":
         level = "0" if mismatch_level is None else mismatch_level
-        rhos = [0.2] + _auxiliary_rhos(K, level, seed)
+        rhos = [float(class_varying_target_rho)] + _auxiliary_rhos(K, level, seed, class_varying_target_rho)
     else:
         raise ValueError(f"Unknown covariance scenario={scenario!r}")
     covariances = np.stack([make_ar1_covariance(d, r, jitter=jitter) for r in rhos], axis=0)
@@ -89,7 +96,7 @@ def make_component_covariances(
 
 
 def make_gaussian_mixture_spec(
-    K: int = 8,
+    K: int = 3,
     d: int = 100,
     Delta: float = 20.0,
     seed: int = 0,
@@ -98,10 +105,11 @@ def make_gaussian_mixture_spec(
     covariance_scenario: str = "shared",
     rho: float | None = 0.2,
     mismatch_level: str | None = None,
-    jitter: float = 1e-5,
+    jitter: float = 0.0,
+    class_varying_target_rho: float = 0.1,
 ) -> GaussianMixtureSpec:
     means = make_component_means(K, d, Delta, seed, min_pairwise_mean_distance)
-    covs, rhos = make_component_covariances(K, d, covariance_scenario, rho, mismatch_level, seed + 10_000, jitter)
+    covs, rhos = make_component_covariances(K, d, covariance_scenario, rho, mismatch_level, seed + 10_000, jitter, class_varying_target_rho)
     return GaussianMixtureSpec(means=means, covariances=covs, rhos=rhos, target_class=target_class)
 
 
