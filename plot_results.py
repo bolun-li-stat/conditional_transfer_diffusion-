@@ -11,7 +11,9 @@ from sklearn.decomposition import PCA
 
 from utils import ensure_dir, standard_error
 
-METRICS = ["score_risk", "gaussian_w2_squared", "covariance_error", "mean_error", "mmd_rbf", "validation_epsilon_mse"]
+MAIN_METRICS = ["score_risk", "validation_epsilon_mse", "gaussian_w2_squared", "mmd_rbf"]
+SUPPLEMENTARY_METRICS = ["mean_error", "covariance_error"]
+METRICS = MAIN_METRICS + SUPPLEMENTARY_METRICS
 
 
 def load_metrics(results_dir: Path) -> pd.DataFrame:
@@ -28,7 +30,7 @@ def load_metrics(results_dir: Path) -> pd.DataFrame:
 
 
 def aggregate(df: pd.DataFrame) -> pd.DataFrame:
-    group_cols = [c for c in ["experiment_type", "covariance_scenario", "rho", "mismatch_level", "K", "n", "n_target_train", "model_type", "sampling_mode"] if c in df.columns]
+    group_cols = [c for c in ["experiment_type", "covariance_scenario", "rho", "mismatch_level", "target_rho", "auxiliary_rhos", "sqrt_alpha_bar_T", "K", "n", "n_target_train", "model_type", "sampling_mode"] if c in df.columns]
     rows = []
     for keys, sub in df.groupby(group_cols, dropna=False):
         row = dict(zip(group_cols, keys if isinstance(keys, tuple) else (keys,)))
@@ -41,22 +43,29 @@ def aggregate(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _setting_label(row: pd.Series) -> str:
+    if row.get("covariance_scenario") == "shared":
+        return f"rho={row.get('rho')}"
+    return f"mismatch={row.get('mismatch_level')}"
+
+
 def _plot_metric_vs(df: pd.DataFrame, x: str, metric: str, experiment: str, out: Path) -> None:
-    sub = df[df["experiment_type"] == experiment]
+    sub = df[df["experiment_type"] == experiment].copy()
     if sub.empty or x not in sub.columns:
         return
+    sub["covariance_setting"] = sub.apply(_setting_label, axis=1)
     for scenario, ss in sub.groupby("covariance_scenario", dropna=False):
-        plt.figure(figsize=(7, 4.5))
-        for model, mm in ss.groupby("model_type"):
+        plt.figure(figsize=(9, 5.5))
+        for (setting, model), mm in ss.groupby(["covariance_setting", "model_type"], dropna=False):
             mean_col, se_col = f"{metric}_mean", f"{metric}_se"
             if mean_col not in mm:
                 continue
             mm = mm.sort_values(x)
-            plt.errorbar(mm[x], mm[mean_col], yerr=mm.get(se_col, 0), marker="o", capsize=3, label=model)
+            plt.errorbar(mm[x], mm[mean_col], yerr=mm.get(se_col, 0), marker="o", capsize=3, label=f"{model} | {setting}")
         plt.xlabel(x)
         plt.ylabel(metric)
         plt.title(f"{metric} vs {x} | {experiment} | {scenario}")
-        plt.legend()
+        plt.legend(fontsize=7)
         plt.tight_layout()
         plt.savefig(out / f"{experiment}_{scenario}_{metric}_vs_{x}.png", dpi=160)
         plt.close()
@@ -64,12 +73,9 @@ def _plot_metric_vs(df: pd.DataFrame, x: str, metric: str, experiment: str, out:
 
 def plot_metric_curves(agg: pd.DataFrame, figure_dir: Path) -> None:
     ensure_dir(figure_dir)
-    _plot_metric_vs(agg, "n_target_train", "score_risk", "low_target_data", figure_dir)
-    _plot_metric_vs(agg, "n", "score_risk", "same_total_budget", figure_dir)
-    _plot_metric_vs(agg, "n_target_train", "gaussian_w2_squared", "low_target_data", figure_dir)
-    _plot_metric_vs(agg, "n", "gaussian_w2_squared", "same_total_budget", figure_dir)
-    _plot_metric_vs(agg, "n", "validation_epsilon_mse", "same_total_budget", figure_dir)
-    _plot_metric_vs(agg, "n_target_train", "validation_epsilon_mse", "low_target_data", figure_dir)
+    for metric in MAIN_METRICS:
+        _plot_metric_vs(agg, "n_target_train", metric, "low_target_data", figure_dir)
+        _plot_metric_vs(agg, "n", metric, "same_total_budget", figure_dir)
 
 
 def plot_mismatch_differences(df: pd.DataFrame, figure_dir: Path) -> None:
@@ -81,7 +87,7 @@ def plot_mismatch_differences(df: pd.DataFrame, figure_dir: Path) -> None:
         if sub.empty:
             continue
         pivot_keys = [c for c in ["seed", "n", "n_target_train", "mismatch_level"] if c in sub.columns]
-        for metric in ["score_risk", "gaussian_w2_squared", "covariance_error", "mean_error", "mmd_rbf"]:
+        for metric in MAIN_METRICS:
             if metric not in sub.columns:
                 continue
             wide = sub.pivot_table(index=pivot_keys, columns="model_type", values=metric, aggfunc="mean").reset_index()
@@ -106,7 +112,7 @@ def plot_mismatch_differences(df: pd.DataFrame, figure_dir: Path) -> None:
 def plot_summary_bars(agg: pd.DataFrame, figure_dir: Path) -> None:
     if agg.empty:
         return
-    for metric in ["score_risk", "gaussian_w2_squared", "covariance_error", "mean_error", "mmd_rbf"]:
+    for metric in MAIN_METRICS:
         mean_col = f"{metric}_mean"
         if mean_col not in agg:
             continue
@@ -200,6 +206,12 @@ def main() -> None:
         return
     agg = aggregate(df)
     agg.to_csv(results_dir / "aggregated_metrics.csv", index=False)
+    sample_cols = [c for c in ["experiment_type", "n", "n_target_train", "model_type"] if c in df.columns]
+    cov_cols = [c for c in ["experiment_type", "covariance_scenario", "rho", "mismatch_level", "target_rho", "model_type"] if c in df.columns]
+    if sample_cols:
+        df.groupby(sample_cols, dropna=False)[[m for m in METRICS if m in df.columns]].agg(["mean", "sem"]).reset_index().to_csv(results_dir / "summary_by_sample_size_and_model.csv", index=False)
+    if cov_cols:
+        df.groupby(cov_cols, dropna=False)[[m for m in METRICS if m in df.columns]].agg(["mean", "sem"]).reset_index().to_csv(results_dir / "summary_by_covariance_setting_and_model.csv", index=False)
     plot_metric_curves(agg, figure_dir)
     plot_mismatch_differences(df, figure_dir)
     plot_summary_bars(agg, figure_dir)

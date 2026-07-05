@@ -14,6 +14,7 @@ from conditional_model import ConditionalDenoiser
 from config import (
     ExperimentConfig,
     config_to_dict,
+    sqrt_alpha_bar_T,
     default_experiment1_configs,
     default_experiment2_configs,
     default_smoke_config,
@@ -192,6 +193,7 @@ def run_single_setting(cfg: ExperimentConfig, force: bool = False) -> pd.DataFra
         rho=cfg.data.rho,
         mismatch_level=cfg.data.mismatch_level,
         jitter=cfg.data.jitter,
+        class_varying_target_rho=cfg.data.class_varying_target_rho,
     )
     split = _build_split(cfg, spec)
     diffusion = DDPM(cfg.diffusion, device)
@@ -222,6 +224,9 @@ def run_single_setting(cfg: ExperimentConfig, force: bool = False) -> pd.DataFra
             "covariance_scenario": cfg.data.covariance_scenario,
             "rho": cfg.data.rho,
             "mismatch_level": cfg.data.mismatch_level,
+            "target_rho": spec.rhos[spec.target_index],
+            "auxiliary_rhos": ";".join(f"{r:.12g}" for i, r in enumerate(spec.rhos) if i != spec.target_index),
+            "sqrt_alpha_bar_T": sqrt_alpha_bar_T(cfg.diffusion),
             "K": cfg.data.K,
             "d": cfg.data.d,
             "Delta": cfg.data.Delta,
@@ -277,13 +282,13 @@ def build_cli_configs(args: argparse.Namespace) -> list[ExperimentConfig]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment", choices=["smoke", "low_target_data", "same_total_budget", "all"], default="smoke")
-    parser.add_argument("--results-dir", default="results_T500")
+    parser.add_argument("--results-dir", default="results_T1000_K3")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--sampling-mode", choices=["balanced", "natural"], default="balanced")
     parser.add_argument("--training-steps", type=int, default=None)
     parser.add_argument("--n-generated", type=int, default=None)
     parser.add_argument("--score-risk-mc-samples", type=int, default=None)
-    parser.add_argument("--seeds", nargs="*", type=int, default=[0, 1, 2])
+    parser.add_argument("--seeds", nargs="*", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--save-samples", action="store_true")
