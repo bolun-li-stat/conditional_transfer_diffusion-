@@ -1,0 +1,11 @@
+torch
+torchvision
+torchmetrics
+torch-fidelity
+numpy
+pandas
+pyyaml
+matplotlib
+tqdm
+pillow
+scikit-learn
