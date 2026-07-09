@@ -82,6 +82,7 @@ def rows_for_experiment(exp: str, cfg: dict, config_path: str) -> list[dict]:
                         aux_synsets = select_aux_synsets(auxiliary_sets, "mix" if aux_set == "mix" else aux_set, k_aux)
                         rows.append(_row(exp, cfg, config_path, target, int(n0), m_per_aux, k_aux, int(seed), f"conditional_{aux_set}", aux_set, aux_synsets))
                 elif exp == "C":
+                    rows.append(_row(exp, cfg, config_path, target, int(n0), m_per_aux, k_aux, int(seed), "unconditional_n0", "none", []))
                     for composition in exp_cfg.get("compositions", ["close_only", "mostly_close", "balanced_mix", "mostly_far", "far_only"]):
                         aux_synsets = select_aux_synsets(auxiliary_sets, composition, k_aux)
                         rows.append(_row(exp, cfg, config_path, target, int(n0), m_per_aux, k_aux, int(seed), f"similarity_{composition}", composition, aux_synsets))

@@ -21,6 +21,7 @@ class DatasetBundle:
     aux_synsets: list[str]
     total_train_images: int
     num_target_available: int
+    aux_eval_datasets: list[Dataset] | None = None
     skipped: bool = False
     skip_reason: str = ""
 
@@ -71,11 +72,15 @@ def build_datasets_for_job(cfg: dict[str, Any], job: dict[str, Any] | None, *, n
         target_need = n0 + k_aux * m_per_aux
     class_labels = [target_synset] + aux_synsets
 
+    eval_pool_size = int(cfg.get("evaluation", {}).get("real_eval_max", cfg.get("num_real_eval", 1000)))
+
     if cfg.get("use_fake_data", False):
         total = target_need if not conditional else n0 + len(aux_synsets) * m_per_aux
         train = build_fake_data(max(total, 1), image_size, max(len(class_labels), 1), seed)
         val = build_fake_data(max(n0, 1), image_size, 1, seed + 1000)
-        return DatasetBundle(train=train, val=val, target_eval=val, class_labels=class_labels, aux_synsets=aux_synsets, total_train_images=total, num_target_available=int(cfg.get("fake_data_size", 100000)))
+        target_eval = build_fake_data(max(eval_pool_size, n0, 1), image_size, 1, seed + 2000)
+        aux_eval = [build_fake_data(max(eval_pool_size // max(len(aux_synsets), 1), 1), image_size, 1, seed + 3000 + i) for i, _ in enumerate(aux_synsets)]
+        return DatasetBundle(train=train, val=val, target_eval=target_eval, class_labels=class_labels, aux_synsets=aux_synsets, total_train_images=total, num_target_available=int(cfg.get("fake_data_size", 100000)), aux_eval_datasets=aux_eval)
 
     if dataset_name.startswith("cifar"):
         train_base = load_cifar10(data_root, image_size, train=True, download=bool(cfg.get("download", True)))
@@ -88,11 +93,19 @@ def build_datasets_for_job(cfg: dict[str, Any], job: dict[str, Any] | None, *, n
         train_indices = indices_for_classes(train_base, [target_id] + aux_ids, counts, seed)
         val_count = min(max(n0, 1), sum(1 for y in val_base.targets if int(y) == target_id))
         val_indices = indices_for_classes(val_base, [target_id], {target_id: val_count}, seed + 1)
+        eval_count = min(eval_pool_size, sum(1 for y in val_base.targets if int(y) == target_id))
+        eval_indices = indices_for_classes(val_base, [target_id], {target_id: eval_count}, seed + 2)
         label_to_new = {old: new for new, old in enumerate([target_id] + aux_ids)}
         train = RemappedDataset(Subset(train_base, train_indices), [target_id] + aux_ids, label_to_new)
         val = RemappedDataset(Subset(val_base, val_indices), [target_id], {target_id: 0})
+        target_eval = RemappedDataset(Subset(val_base, eval_indices), [target_id], {target_id: 0})
+        aux_eval = []
+        for i, aux_id in enumerate(aux_ids):
+            aux_count = min(eval_pool_size // max(len(aux_ids), 1), sum(1 for y in val_base.targets if int(y) == aux_id))
+            aux_indices = indices_for_classes(val_base, [aux_id], {aux_id: aux_count}, seed + 100 + i) if aux_count else []
+            aux_eval.append(RemappedDataset(Subset(val_base, aux_indices), [aux_id], {aux_id: i + 1}))
         target_available = sum(1 for label in train_base.targets if int(label) == target_id)
-        return DatasetBundle(train=train, val=val, target_eval=val, class_labels=class_labels, aux_synsets=aux_synsets, total_train_images=len(train), num_target_available=target_available)
+        return DatasetBundle(train=train, val=val, target_eval=target_eval, class_labels=class_labels, aux_synsets=aux_synsets, total_train_images=len(train), num_target_available=target_available, aux_eval_datasets=aux_eval)
 
     validate_synsets(data_root, "train", class_labels)
     validate_synsets(data_root, "val", [target_synset])
@@ -105,7 +118,16 @@ def build_datasets_for_job(cfg: dict[str, Any], job: dict[str, Any] | None, *, n
     target_available = sum(1 for _, y in train_base.samples if y == train_base.class_to_idx[target_synset])
     val_available = sum(1 for _, y in val_base.samples if y == val_base.class_to_idx[target_synset])
     val_count = min(max(n0, 1), val_available)
+    eval_count = min(eval_pool_size, val_available)
     val_indices, val_map = indices_for_synsets(val_base, [target_synset], {target_synset: val_count}, seed + 1)
+    eval_indices, eval_map = indices_for_synsets(val_base, [target_synset], {target_synset: eval_count}, seed + 2)
     train = RemappedImageFolder(Subset(train_base, train_indices), old_to_new)
     val = RemappedImageFolder(Subset(val_base, val_indices), val_map)
-    return DatasetBundle(train=train, val=val, target_eval=val, class_labels=class_labels, aux_synsets=aux_synsets, total_train_images=len(train), num_target_available=target_available)
+    target_eval = RemappedImageFolder(Subset(val_base, eval_indices), eval_map)
+    aux_eval = []
+    for i, aux in enumerate(aux_synsets):
+        aux_available = sum(1 for _, y in val_base.samples if y == val_base.class_to_idx.get(aux, -1))
+        aux_count = min(eval_pool_size // max(len(aux_synsets), 1), aux_available)
+        aux_indices, aux_map = indices_for_synsets(val_base, [aux], {aux: aux_count}, seed + 100 + i) if aux_count else ([], {})
+        aux_eval.append(RemappedImageFolder(Subset(val_base, aux_indices), aux_map))
+    return DatasetBundle(train=train, val=val, target_eval=target_eval, class_labels=class_labels, aux_synsets=aux_synsets, total_train_images=len(train), num_target_available=target_available, aux_eval_datasets=aux_eval)

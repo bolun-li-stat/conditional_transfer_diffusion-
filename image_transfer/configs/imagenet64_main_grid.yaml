@@ -22,3 +22,10 @@ experiments:
   A: {enabled: true, n0_values: [50, 100, 250, 500], aux_sets: [close, medium, far, mix]}
   B: {enabled: false, n0_values: [50, 100], aux_sets: [close, medium, far, mix], skip_if_insufficient_target_images: true}
   C: {enabled: false, n0_values: [100], compositions: [close_only, mostly_close, balanced_mix, mostly_far, far_only]}
+
+evaluation:
+  compute_fid_kid: true
+  compute_classifier: true
+  compute_feature_similarity: true
+  make_nearest_neighbors: true
+  real_eval_max: 1000

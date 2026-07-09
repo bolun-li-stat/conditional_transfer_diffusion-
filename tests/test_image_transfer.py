@@ -16,7 +16,7 @@ def run_cmd(cmd, env=None):
 
 def test_make_job_grid_abc(tmp_path: Path):
     env = {"RESULTS_ROOT": str(tmp_path / "results")}
-    counts = {"A": 30, "B": 10, "C": 10}
+    counts = {"A": 30, "B": 10, "C": 12}
     for exp, expected in counts.items():
         out = tmp_path / f"{exp}.csv"
         run_cmd([sys.executable, "-m", "image_transfer.scripts.make_job_grid", "--experiment", exp, "--config", "image_transfer/configs/cifar10_sanity.yaml", "--out", str(out)], env=env)

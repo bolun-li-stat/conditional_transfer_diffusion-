@@ -5,9 +5,11 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
+import torch
 
 EXP_DIR = {"A": "A_equal_target", "B": "B_equal_total", "C": "C_similarity_sweep"}
 METRICS = ["fid_target", "kid_target_mean", "validation_epsilon_mse_target", "classifier_target_top1_acc", "auxiliary_leakage_rate"]
+NOISE_BINS = ["validation_epsilon_mse_low_noise", "validation_epsilon_mse_mid_noise", "validation_epsilon_mse_high_noise"]
 
 
 def _plot_metric_curves(df: pd.DataFrame, figdir: Path, experiment: str) -> None:
@@ -26,17 +28,17 @@ def _plot_metric_curves(df: pd.DataFrame, figdir: Path, experiment: str) -> None
         plt.close()
 
 
-def _plot_gap(df: pd.DataFrame, figdir: Path, experiment: str) -> None:
+def _plot_gap(df: pd.DataFrame, figdir: Path, experiment: str) -> pd.DataFrame:
     if "fid_target" not in df:
-        return
-    baseline_name = "unconditional_n0" if experiment == "A" else "unconditional_equal_total"
+        return pd.DataFrame()
+    baseline_name = "unconditional_n0" if experiment in {"A", "C"} else "unconditional_equal_total"
     baseline = df[df["model_type"] == baseline_name][["target_synset", "n0", "seed", "fid_target"]]
     if baseline.empty:
-        return
+        return pd.DataFrame()
     merged = df.merge(baseline, on=["target_synset", "n0", "seed"], suffixes=("", "_baseline"))
-    merged = merged[~merged["model_type"].eq(baseline_name)]
+    merged = merged[~merged["model_type"].eq(baseline_name)].copy()
     if merged.empty:
-        return
+        return merged
     merged["delta_fid"] = merged["fid_target_baseline"] - merged["fid_target"]
     plt.figure(figsize=(7, 4))
     for name, group in merged.groupby("model_type"):
@@ -47,11 +49,41 @@ def _plot_gap(df: pd.DataFrame, figdir: Path, experiment: str) -> None:
     plt.ylabel("FID baseline - FID model")
     plt.legend(fontsize=7)
     plt.tight_layout()
-    plt.savefig(figdir / f"{experiment}_transfer_gap.png", dpi=160)
+    suffix = "replacement_gap" if experiment == "B" else "transfer_gap"
+    plt.savefig(figdir / f"{experiment}_{suffix}.png", dpi=160)
+    plt.close()
+    return merged
+
+
+def _plot_noise_bins(df: pd.DataFrame, figdir: Path, experiment: str) -> None:
+    cols = [c for c in NOISE_BINS if c in df]
+    if not cols:
+        return
+    summary = df.groupby("model_type")[cols].mean(numeric_only=True)
+    ax = summary.plot(kind="bar", figsize=(8, 4))
+    ax.set_ylabel("epsilon MSE")
+    plt.tight_layout()
+    plt.savefig(figdir / f"{experiment}_denoising_noise_bins.png", dpi=160)
     plt.close()
 
 
-def _plot_composition(df: pd.DataFrame, figdir: Path) -> None:
+def _plot_sample_grid(exp_dir: Path, figdir: Path, max_per_model: int = 8) -> None:
+    try:
+        from torchvision.utils import make_grid, save_image
+    except Exception:
+        return
+    sample_files = sorted((exp_dir / "samples").glob("*_samples.pt"))[:8]
+    if not sample_files:
+        return
+    rows = []
+    for sample_path in sample_files:
+        samples = torch.load(sample_path, map_location="cpu")[:max_per_model]
+        rows.append(samples)
+    grid = make_grid(torch.cat(rows, dim=0), nrow=max_per_model, normalize=True, value_range=(-1, 1))
+    save_image(grid, figdir / "sample_grid.png")
+
+
+def _plot_composition(df: pd.DataFrame, figdir: Path, gap_df: pd.DataFrame) -> None:
     order = ["close_only", "mostly_close", "balanced_mix", "mostly_far", "far_only"]
     cdf = df[df["aux_set"].isin(order)].copy()
     if cdf.empty:
@@ -68,13 +100,13 @@ def _plot_composition(df: pd.DataFrame, figdir: Path) -> None:
         plt.tight_layout()
         plt.savefig(figdir / f"C_composition_{metric}.png", dpi=160)
         plt.close()
-    if "average_auxiliary_similarity" in cdf and "fid_target" in cdf:
+    if not gap_df.empty and "average_auxiliary_similarity" in gap_df:
         plt.figure(figsize=(5, 4))
-        plt.scatter(cdf["average_auxiliary_similarity"], cdf["fid_target"])
+        plt.scatter(gap_df["average_auxiliary_similarity"], gap_df["delta_fid"])
         plt.xlabel("average auxiliary feature similarity")
-        plt.ylabel("FID")
+        plt.ylabel("Delta_FID")
         plt.tight_layout()
-        plt.savefig(figdir / "C_similarity_fid_scatter.png", dpi=160)
+        plt.savefig(figdir / "C_similarity_delta_fid_scatter.png", dpi=160)
         plt.close()
 
 
@@ -91,9 +123,11 @@ def main() -> None:
     figdir.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(metrics_path)
     _plot_metric_curves(df, figdir, args.experiment)
-    _plot_gap(df, figdir, args.experiment)
+    gap_df = _plot_gap(df, figdir, args.experiment)
+    _plot_noise_bins(df, figdir, args.experiment)
+    _plot_sample_grid(exp_dir, figdir)
     if args.experiment == "C":
-        _plot_composition(df, figdir)
+        _plot_composition(df, figdir, gap_df)
     print(figdir)
 
 

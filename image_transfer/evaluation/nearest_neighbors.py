@@ -4,23 +4,41 @@ from pathlib import Path
 
 import torch
 
+from .feature_similarity import build_feature_extractor
 
-def nearest_neighbor_indices(generated: torch.Tensor, real: torch.Tensor, k: int = 1) -> torch.Tensor:
-    gen = generated.flatten(1).float().cpu()
-    ref = real.flatten(1).float().cpu()
+
+@torch.no_grad()
+def nearest_neighbor_indices(generated: torch.Tensor, real: torch.Tensor, k: int = 1, device="cpu") -> torch.Tensor:
+    extractor = build_feature_extractor(device)
+    gen = extractor(generated.to(device).float()).cpu()
+    ref = extractor(real.to(device).float()).cpu()
     distances = torch.cdist(gen, ref)
     return distances.topk(k, largest=False).indices
 
 
-def make_nearest_neighbor_grid(generated: torch.Tensor, real: torch.Tensor, out_path: str | Path, max_items: int = 8) -> None:
+def make_nearest_neighbor_grid(
+    generated: torch.Tensor,
+    target_real: torch.Tensor,
+    aux_real: torch.Tensor | None,
+    out_path: str | Path,
+    max_items: int = 8,
+    device="cpu",
+) -> None:
     try:
         from torchvision.utils import make_grid, save_image
     except Exception:
         return
-    indices = nearest_neighbor_indices(generated[:max_items], real, k=1).squeeze(1)
-    pairs = []
-    for i, idx in enumerate(indices.tolist()):
-        pairs.extend([generated[i].cpu(), real[idx].cpu()])
-    grid = make_grid(torch.stack(pairs), nrow=2, normalize=True, value_range=(-1, 1))
+    target_idx = nearest_neighbor_indices(generated[:max_items], target_real, k=1, device=device).squeeze(1)
+    aux_idx = None
+    if aux_real is not None and len(aux_real):
+        aux_idx = nearest_neighbor_indices(generated[:max_items], aux_real, k=1, device=device).squeeze(1)
+    rows = []
+    for i, idx in enumerate(target_idx.tolist()):
+        rows.append(generated[i].cpu())
+        rows.append(target_real[idx].cpu())
+        if aux_idx is not None:
+            rows.append(aux_real[aux_idx[i].item()].cpu())
+    nrow = 3 if aux_idx is not None else 2
+    grid = make_grid(torch.stack(rows), nrow=nrow, normalize=True, value_range=(-1, 1))
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     save_image(grid, out_path)

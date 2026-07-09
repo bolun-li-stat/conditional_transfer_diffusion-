@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 from image_transfer.data import build_datasets_for_job, count_available_target_images
 from image_transfer.evaluation.classifier_fidelity import evaluate_classifier_fidelity
 from image_transfer.evaluation.fid_kid import compute_fid_kid
+from image_transfer.evaluation.feature_similarity import average_auxiliary_similarity
 from image_transfer.evaluation.nearest_neighbors import make_nearest_neighbor_grid
 from image_transfer.scripts.make_job_grid import EXP_DIR
 from image_transfer.training.trainer import train_image_model
@@ -168,12 +169,13 @@ def run(args, job: dict | None = None) -> dict:
     torch.save(samples.cpu(), sample_path)
 
     real_batches = []
+    real_eval_limit = int(cfg.get("evaluation", {}).get("real_eval_max", max(num_generated, 1000)))
     val_loader = DataLoader(bundle.target_eval, batch_size=int(cfg.get("training", {}).get("batch_size", 32)), shuffle=False, num_workers=0)
     for x, _ in val_loader:
         real_batches.append(x)
-        if sum(batch.shape[0] for batch in real_batches) >= num_generated:
+        if sum(batch.shape[0] for batch in real_batches) >= real_eval_limit:
             break
-    real = torch.cat(real_batches, dim=0)[:num_generated]
+    real = torch.cat(real_batches, dim=0)[:real_eval_limit]
     row["num_real_eval"] = int(real.shape[0])
     if cfg.get("evaluation", {}).get("compute_fid_kid", True):
         row.update(compute_fid_kid(samples.cpu(), real, outdir / "cache" / f"real_{target_synset}_{image_size}.pt"))
@@ -183,8 +185,21 @@ def run(args, job: dict | None = None) -> dict:
         row.update(evaluate_classifier_fidelity(samples.cpu(), target_synset, bundle.aux_synsets, device=device))
     else:
         row.update({"classifier_target_top1_acc": float("nan"), "classifier_target_top5_acc": float("nan"), "auxiliary_leakage_rate": float("nan"), "top1_prediction_histogram_json": "{}"})
-    make_nearest_neighbor_grid(samples.cpu(), real, outdir / "figures" / f"{run_id}_nearest_neighbors.png")
-    row["average_auxiliary_similarity"] = float("nan")
+    aux_real = None
+    if bundle.aux_eval_datasets:
+        aux_batches = []
+        for aux_dataset in bundle.aux_eval_datasets:
+            for x, _ in DataLoader(aux_dataset, batch_size=int(cfg.get("training", {}).get("batch_size", 32)), shuffle=False, num_workers=0):
+                aux_batches.append(x)
+                break
+        if aux_batches:
+            aux_real = torch.cat(aux_batches, dim=0)
+    if cfg.get("evaluation", {}).get("make_nearest_neighbors", True):
+        make_nearest_neighbor_grid(samples.cpu(), real, aux_real, outdir / "figures" / f"{run_id}_nearest_neighbors.png", device=device)
+    if cfg.get("evaluation", {}).get("compute_feature_similarity", experiment == "C") and bundle.aux_eval_datasets:
+        row["average_auxiliary_similarity"] = average_auxiliary_similarity(bundle.target_eval, bundle.aux_eval_datasets, batch_size=int(cfg.get("training", {}).get("batch_size", 32)), device=device)
+    else:
+        row["average_auxiliary_similarity"] = float("nan")
     row["wallclock_eval_seconds"] = time.time() - eval_start
 
     append_csv_row(outdir / "metrics.csv", row, FIELDS)
