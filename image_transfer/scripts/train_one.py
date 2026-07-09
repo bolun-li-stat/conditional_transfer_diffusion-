@@ -1,33 +1,216 @@
 from __future__ import annotations
-import argparse, csv, json, time
+
+import argparse
+import csv
+import json
+import time
 from pathlib import Path
+from types import SimpleNamespace
+
 import torch
-from torch.utils.data import TensorDataset
-from image_transfer.utils.io import load_yaml, ensure_dir, append_csv_row, resolve_env_path
-from image_transfer.utils.seed import set_seed
-from image_transfer.utils.device import get_device
-from image_transfer.training.trainer import train_image_model
+import yaml
+from torch.utils.data import DataLoader
+
+from image_transfer.data import build_datasets_for_job, count_available_target_images
+from image_transfer.evaluation.classifier_fidelity import evaluate_classifier_fidelity
+from image_transfer.evaluation.fid_kid import compute_fid_kid
+from image_transfer.evaluation.nearest_neighbors import make_nearest_neighbor_grid
 from image_transfer.scripts.make_job_grid import EXP_DIR
-FIELDS=['dataset','experiment','experiment_name','target_synset','target_name','aux_set','aux_synsets','aux_composition','model_type','n0','m_per_aux','K_aux','total_train_images','seed','image_size','training_steps','checkpoint_path','final_train_loss','validation_epsilon_mse_target','validation_epsilon_mse_low_noise','validation_epsilon_mse_mid_noise','validation_epsilon_mse_high_noise','fid_target','kid_target_mean','kid_target_std','classifier_target_top1_acc','classifier_target_top5_acc','auxiliary_leakage_rate','top1_prediction_histogram_json','num_generated','num_real_eval','sampler','sampling_steps','wallclock_train_seconds','wallclock_eval_seconds','skipped_equal_total_baseline','skip_reason']
+from image_transfer.training.trainer import train_image_model
+from image_transfer.utils.device import get_device
+from image_transfer.utils.io import append_csv_row, ensure_dir, load_yaml, resolve_env_path
+from image_transfer.utils.seed import set_seed
 
-def fake_dataset(n, image_size, num_classes, seed):
-    g=torch.Generator().manual_seed(seed); x=torch.rand(n,3,image_size,image_size,generator=g)*2-1; y=torch.arange(n)%num_classes; return TensorDataset(x,y.long())
+FIELDS = [
+    "dataset", "experiment", "experiment_name", "target_synset", "target_name", "aux_set", "aux_synsets",
+    "aux_composition", "model_type", "n0", "m_per_aux", "K_aux", "total_train_images", "seed", "image_size",
+    "training_steps", "checkpoint_path", "final_train_loss", "validation_epsilon_mse_target",
+    "validation_epsilon_mse_low_noise", "validation_epsilon_mse_mid_noise", "validation_epsilon_mse_high_noise",
+    "fid_target", "kid_target_mean", "kid_target_std", "classifier_target_top1_acc", "classifier_target_top5_acc",
+    "auxiliary_leakage_rate", "top1_prediction_histogram_json", "average_auxiliary_similarity", "num_generated",
+    "num_real_eval", "sampler", "sampling_steps", "wallclock_train_seconds", "wallclock_eval_seconds",
+    "skipped_equal_total_baseline", "skip_reason",
+]
 
-def run(args, job=None):
-    cfg=load_yaml(args.config); exp=args.experiment or (job and job['experiment']) or 'A'; set_seed(int(args.seed or (job and job.get('seed',0)) or 0))
-    image_size=int(args.image_size or cfg.get('image_size',32)); n0=int(args.n0 or (job and job.get('n0',8)) or 8); m=int(args.m_per_aux or (job and job.get('m_per_aux',n0)) or n0); k=int(args.K_aux or (job and job.get('K_aux',cfg.get('K_aux',1))) or 1)
-    steps=int(args.max_steps if args.max_steps is not None else cfg.get('training',{}).get('steps',2)); num_classes=1+k; model_type=(job and job.get('model_type')) or 'unconditional_n0'; conditional=not model_type.startswith('unconditional')
-    total=n0+(k*m if conditional else 0)
-    if model_type=='unconditional_equal_total': total=n0+k*m
-    dataset=fake_dataset(max(total,1),image_size,num_classes,int(args.seed or 0)); val=fake_dataset(max(n0,1),image_size,num_classes,int(args.seed or 0)+1)
-    outdir=Path((job and job.get('output_dir')) or Path(resolve_env_path(cfg.get('output_root'),'image_transfer_results'))/EXP_DIR[exp]); ensure_dir(outdir)
-    ckpt=outdir/'checkpoints'/f'{model_type}_n0{n0}_seed{args.seed or 0}.pt'
-    t0=time.time(); model,diff,metrics=train_image_model(dataset,val,conditional=conditional,num_classes=num_classes,image_size=image_size,base_channels=int(cfg.get('model',{}).get('base_channels',16)),channel_mults=cfg.get('model',{}).get('channel_mults',[1]),timesteps=int(cfg.get('diffusion',{}).get('timesteps',10)),schedule=cfg.get('diffusion',{}).get('schedule','linear'),steps=steps,batch_size=int(cfg.get('training',{}).get('batch_size',4)),lr=float(cfg.get('optimizer',{}).get('lr',1e-3)),device=get_device(args.device or cfg.get('device','cpu')),checkpoint_path=ckpt)
-    eval_start=time.time(); samples=diff.sample(model,(int(args.num_generated or cfg.get('num_generated',4)),3,image_size,image_size), y=torch.zeros(int(args.num_generated or 4),dtype=torch.long,device=diff.device) if conditional else None, steps=int(cfg.get('sampling_steps',2))); wall_eval=time.time()-eval_start
-    ensure_dir(outdir/'samples'); torch.save(samples.cpu(), outdir/'samples'/f'{model_type}_samples.pt')
-    row={f:'' for f in FIELDS}; row.update(metrics); row.update({'dataset':cfg.get('dataset','fake'),'experiment':exp,'experiment_name':{'A':'equal_target','B':'equal_total','C':'similarity_sweep'}[exp],'target_synset':(job or {}).get('target_synset','dog'),'target_name':(job or {}).get('target_name','dog'),'aux_set':(job or {}).get('aux_set','none'),'aux_synsets':(job or {}).get('aux_composition','[]'),'aux_composition':(job or {}).get('aux_set','none'),'model_type':model_type,'n0':n0,'m_per_aux':m,'K_aux':k,'total_train_images':total,'seed':int(args.seed or (job and job.get('seed',0)) or 0),'image_size':image_size,'training_steps':steps,'checkpoint_path':str(ckpt),'fid_target':float('nan'),'kid_target_mean':float('nan'),'kid_target_std':float('nan'),'classifier_target_top1_acc':float('nan'),'classifier_target_top5_acc':float('nan'),'auxiliary_leakage_rate':float('nan'),'top1_prediction_histogram_json':'{}','num_generated':int(args.num_generated or cfg.get('num_generated',4)),'num_real_eval':n0,'sampler':'ddpm','sampling_steps':int(cfg.get('sampling_steps',2)),'wallclock_eval_seconds':wall_eval,'skipped_equal_total_baseline':False,'skip_reason':''})
-    append_csv_row(outdir/'metrics.csv', row, FIELDS); append_csv_row(Path(resolve_env_path(cfg.get('output_root'),'image_transfer_results'))/'all_metrics.csv', row, FIELDS)
-    print(outdir/'metrics.csv')
-if __name__=='__main__':
-    p=argparse.ArgumentParser(); p.add_argument('--config',required=True); p.add_argument('--experiment',choices=['A','B','C']); p.add_argument('--max-steps',type=int); p.add_argument('--n0',type=int); p.add_argument('--m-per-aux',type=int); p.add_argument('--num-generated',type=int); p.add_argument('--device'); p.add_argument('--seed',type=int,default=0); p.add_argument('--image-size',type=int); p.add_argument('--K-aux',type=int,dest='K_aux')
-    run(p.parse_args())
+
+def read_job(path: str, index: int) -> dict[str, str]:
+    with open(path, newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    if index < 0 or index >= len(rows):
+        raise IndexError(f"job-index {index} out of range for {len(rows)} jobs")
+    return rows[index]
+
+
+def _arg_or_job(args, job: dict | None, key: str, default=None):
+    cli_value = getattr(args, key, None)
+    if cli_value is not None:
+        return cli_value
+    if job and job.get(key) not in {None, ""}:
+        return job[key]
+    return default
+
+
+def deterministic_run_id(job: dict | None, experiment: str, target_synset: str, model_type: str, aux_set: str, n0: int, m_per_aux: int, k_aux: int, seed: int) -> str:
+    if job and job.get("run_id"):
+        return job["run_id"]
+    return f"{experiment}_{target_synset}_{model_type}_{aux_set}_n0{n0}_m{m_per_aux}_k{k_aux}_seed{seed}"
+
+
+def _write_skip_row(cfg: dict, outdir: Path, row: dict) -> None:
+    append_csv_row(outdir / "metrics.csv", row, FIELDS)
+    append_csv_row(Path(resolve_env_path(cfg.get("output_root"), "image_transfer_results")) / "all_metrics.csv", row, FIELDS)
+
+
+def run(args, job: dict | None = None) -> dict:
+    cfg = load_yaml(args.config)
+    experiment = str(_arg_or_job(args, job, "experiment", "A"))
+    seed = int(_arg_or_job(args, job, "seed", 0))
+    set_seed(seed)
+    n0 = int(_arg_or_job(args, job, "n0", 100))
+    m_per_aux = int(getattr(args, "m_per_aux", None) or (job.get("m_per_aux") if job else None) or n0)
+    k_aux = int(getattr(args, "K_aux", None) or (job.get("K_aux") if job else None) or cfg.get("K_aux", 5))
+    image_size = int(getattr(args, "image_size", None) or cfg.get("image_size", 32))
+    model_type = str((job or {}).get("model_type") or getattr(args, "model_type", None) or "unconditional_n0")
+    aux_set = str((job or {}).get("aux_set") or "none")
+    target_synset = str((job or {}).get("target_synset") or cfg.get("targets", [{"synset": "dog"}])[0].get("synset", "dog"))
+    target_name = str((job or {}).get("target_name") or target_synset)
+    outdir = Path((job or {}).get("output_dir") or Path(resolve_env_path(cfg.get("output_root"), "image_transfer_results")) / EXP_DIR[experiment])
+    run_id = deterministic_run_id(job, experiment, target_synset, model_type, aux_set, n0, m_per_aux, k_aux, seed)
+    checkpoint_path = outdir / "checkpoints" / f"{run_id}.pt"
+    log_path = outdir / "logs" / f"{run_id}_train_log.csv"
+    run_config_path = outdir / "configs" / f"{run_id}.yaml"
+    ensure_dir(outdir)
+
+    training_steps = int(getattr(args, "max_steps", None) if getattr(args, "max_steps", None) is not None else cfg.get("training", {}).get("steps", 1000))
+    row = {field: "" for field in FIELDS}
+    row.update({
+        "dataset": cfg.get("dataset", "cifar10"),
+        "experiment": experiment,
+        "experiment_name": {"A": "equal_target", "B": "equal_total", "C": "similarity_sweep"}[experiment],
+        "target_synset": target_synset,
+        "target_name": target_name,
+        "aux_set": aux_set,
+        "aux_synsets": (job or {}).get("aux_composition", "[]"),
+        "aux_composition": aux_set,
+        "model_type": model_type,
+        "n0": n0,
+        "m_per_aux": m_per_aux,
+        "K_aux": k_aux,
+        "seed": seed,
+        "image_size": image_size,
+        "training_steps": training_steps,
+        "checkpoint_path": str(checkpoint_path),
+        "num_generated": int(getattr(args, "num_generated", None) or cfg.get("num_generated", 64)),
+        "sampler": cfg.get("sampler", "ddpm"),
+        "sampling_steps": int(cfg.get("sampling_steps", cfg.get("diffusion", {}).get("timesteps", 1000))),
+        "skipped_equal_total_baseline": False,
+        "skip_reason": "",
+    })
+
+    if model_type == "unconditional_equal_total" and not cfg.get("use_fake_data", False):
+        n_total = n0 + k_aux * m_per_aux
+        available = count_available_target_images(cfg, target_synset)
+        if available < n_total:
+            row.update({
+                "total_train_images": 0,
+                "skipped_equal_total_baseline": True,
+                "skip_reason": "insufficient_target_images",
+            })
+            _write_skip_row(cfg, outdir, row)
+            print(f"skipped {run_id}: insufficient_target_images ({available} < {n_total})")
+            return row
+
+    if getattr(args, "dry_run", False):
+        print(json.dumps({"run_id": run_id, "checkpoint_path": str(checkpoint_path), "output_dir": str(outdir)}, indent=2))
+        return row
+
+    if checkpoint_path.exists() and not getattr(args, "force", False) and not getattr(args, "resume", False):
+        raise FileExistsError(f"Checkpoint exists for {run_id}; pass --force or --resume")
+
+    bundle = build_datasets_for_job(cfg, job, n0=n0, m_per_aux=m_per_aux, k_aux=k_aux, seed=seed, model_type=model_type)
+    row["total_train_images"] = bundle.total_train_images
+    ensure_dir(run_config_path.parent)
+    with open(run_config_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump({"config": cfg, "job": job or {}, "run_id": run_id}, handle, sort_keys=False)
+
+    device = get_device(getattr(args, "device", None) or cfg.get("device", "auto"))
+    model, diffusion, train_metrics = train_image_model(
+        bundle.train,
+        bundle.val,
+        conditional=not model_type.startswith("unconditional"),
+        num_classes=max(len(bundle.class_labels), 1),
+        image_size=image_size,
+        base_channels=int(cfg.get("model", {}).get("base_channels", 64)),
+        channel_mults=cfg.get("model", {}).get("channel_mults", [1, 2, 2, 4]),
+        timesteps=int(cfg.get("diffusion", {}).get("timesteps", 1000)),
+        schedule=cfg.get("diffusion", {}).get("schedule", "linear"),
+        steps=training_steps,
+        batch_size=int(cfg.get("training", {}).get("batch_size", 32)),
+        lr=float(cfg.get("optimizer", {}).get("lr", 2e-4)),
+        device=device,
+        precision=cfg.get("training", {}).get("precision", "fp32"),
+        checkpoint_path=checkpoint_path,
+        train_log_path=log_path,
+        resume=getattr(args, "resume", False),
+        validation_interval=int(cfg.get("training", {}).get("validation_interval", 100)),
+        num_workers=int(cfg.get("training", {}).get("num_workers", 0)),
+    )
+    row.update(train_metrics)
+
+    eval_start = time.time()
+    num_generated = int(row["num_generated"])
+    labels = None
+    if not model_type.startswith("unconditional"):
+        labels = torch.zeros(num_generated, dtype=torch.long, device=diffusion.device)
+    samples = diffusion.sample(model, (num_generated, 3, image_size, image_size), y=labels, steps=int(row["sampling_steps"]))
+    sample_path = outdir / "samples" / f"{run_id}_samples.pt"
+    ensure_dir(sample_path.parent)
+    torch.save(samples.cpu(), sample_path)
+
+    real_batches = []
+    val_loader = DataLoader(bundle.target_eval, batch_size=int(cfg.get("training", {}).get("batch_size", 32)), shuffle=False, num_workers=0)
+    for x, _ in val_loader:
+        real_batches.append(x)
+        if sum(batch.shape[0] for batch in real_batches) >= num_generated:
+            break
+    real = torch.cat(real_batches, dim=0)[:num_generated]
+    row["num_real_eval"] = int(real.shape[0])
+    if cfg.get("evaluation", {}).get("compute_fid_kid", True):
+        row.update(compute_fid_kid(samples.cpu(), real, outdir / "cache" / f"real_{target_synset}_{image_size}.pt"))
+    else:
+        row.update({"fid_target": float("nan"), "kid_target_mean": float("nan"), "kid_target_std": float("nan")})
+    if cfg.get("evaluation", {}).get("compute_classifier", False):
+        row.update(evaluate_classifier_fidelity(samples.cpu(), target_synset, bundle.aux_synsets, device=device))
+    else:
+        row.update({"classifier_target_top1_acc": float("nan"), "classifier_target_top5_acc": float("nan"), "auxiliary_leakage_rate": float("nan"), "top1_prediction_histogram_json": "{}"})
+    make_nearest_neighbor_grid(samples.cpu(), real, outdir / "figures" / f"{run_id}_nearest_neighbors.png")
+    row["average_auxiliary_similarity"] = float("nan")
+    row["wallclock_eval_seconds"] = time.time() - eval_start
+
+    append_csv_row(outdir / "metrics.csv", row, FIELDS)
+    append_csv_row(Path(resolve_env_path(cfg.get("output_root"), "image_transfer_results")) / "all_metrics.csv", row, FIELDS)
+    print(outdir / "metrics.csv")
+    return row
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--experiment", choices=["A", "B", "C"])
+    parser.add_argument("--model-type")
+    parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--n0", type=int)
+    parser.add_argument("--m-per-aux", type=int, dest="m_per_aux")
+    parser.add_argument("--K-aux", type=int, dest="K_aux")
+    parser.add_argument("--num-generated", type=int)
+    parser.add_argument("--device")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--image-size", type=int, dest="image_size")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    return parser
+
+
+if __name__ == "__main__":
+    run(build_parser().parse_args())

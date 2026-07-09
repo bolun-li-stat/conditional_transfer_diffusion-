@@ -1,7 +1,7 @@
 image_transfer_results/
 results_image*/
-data/
-datasets/
+/data/
+/datasets/
 checkpoints/
 samples/
 *.pt

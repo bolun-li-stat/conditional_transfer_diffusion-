@@ -15,7 +15,7 @@ seeds: [0, 1, 2]
 model: {base_channels: 128, channel_mults: [1, 2, 3, 4]}
 diffusion: {timesteps: 1000, schedule: cosine}
 optimizer: {lr: 0.0002}
-training: {steps: 100000, batch_size: 64, num_workers: 4, precision: amp}
+training: {steps: 100000, batch_size: 64, num_workers: 4, precision: amp, validation_interval: 1000}
 sampling_steps: 1000
 num_generated: 5000
 experiments:
