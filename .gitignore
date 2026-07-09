@@ -1,0 +1,17 @@
+image_transfer_results/
+results_image*/
+data/
+datasets/
+checkpoints/
+samples/
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+wandb/
+slurm-*.out
+*.err
+__pycache__/
+*.pyc
+results_T*/
