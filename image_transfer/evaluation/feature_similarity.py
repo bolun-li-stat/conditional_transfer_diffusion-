@@ -6,16 +6,23 @@ from torch.utils.data import DataLoader
 
 
 class _FallbackFeature(nn.Module):
+    extractor_name = "debug_adaptive_avg_pool_4x4"
+    weights_name = "none"
+    preprocessing_name = "clamp[-1,1]_to_[0,1]+adaptive_avg_pool_4x4"
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = ((x.float().clamp(-1, 1) + 1.0) / 2.0)
         return torch.nn.functional.adaptive_avg_pool2d(x, (4, 4)).flatten(1)
 
 
 class _ResNetFeature(nn.Module):
-    def __init__(self, backbone: nn.Module, preprocess: nn.Module) -> None:
+    def __init__(self, backbone: nn.Module, preprocess: nn.Module, weights_name: str) -> None:
         super().__init__()
         self.preprocess = preprocess
         self.features = nn.Sequential(*list(backbone.children())[:-1], nn.Flatten())
+        self.extractor_name = "torchvision_resnet50_imagenet1k"
+        self.weights_name = weights_name
+        self.preprocessing_name = repr(preprocess)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = ((x.float().clamp(-1, 1) + 1.0) / 2.0)
@@ -23,15 +30,22 @@ class _ResNetFeature(nn.Module):
         return self.features(x)
 
 
-def build_feature_extractor(device="cpu") -> nn.Module:
-    """Prefer ImageNet-pretrained ResNet50 features; fall back to pooled pixels."""
+def build_feature_extractor(device="cpu", *, strict: bool = False) -> nn.Module:
+    """Build the fixed ImageNet ResNet-50 extractor used for similarity/NNs.
+
+    ``strict=True`` is intended for paper runs and refuses a change of feature
+    space.  The pooled-pixel fallback remains available only for legacy/debug
+    smoke runs.
+    """
     try:
         from torchvision.models import ResNet50_Weights, resnet50
-    except Exception:
+        weights = ResNet50_Weights.DEFAULT
+        model = resnet50(weights=weights)
+        return _ResNetFeature(model, weights.transforms(), f"{weights.__class__.__name__}.{weights.name}").to(device).eval()
+    except Exception as exc:
+        if strict:
+            raise RuntimeError("pretrained ResNet-50 feature extractor is unavailable") from exc
         return _FallbackFeature().to(device).eval()
-    weights = ResNet50_Weights.DEFAULT
-    model = resnet50(weights=weights)
-    return _ResNetFeature(model, weights.transforms()).to(device).eval()
 
 
 @torch.no_grad()
@@ -51,10 +65,25 @@ def dataset_mean_feature(dataset, extractor: nn.Module | None = None, batch_size
 
 
 @torch.no_grad()
-def average_auxiliary_similarity(target_dataset, aux_datasets: list, batch_size: int = 32, device="cpu") -> float:
+def average_auxiliary_similarity(
+    target_dataset,
+    aux_datasets: list,
+    batch_size: int = 32,
+    device="cpu",
+    *,
+    extractor: nn.Module | None = None,
+    strict: bool = False,
+) -> float:
+    """Average cosine similarity to auxiliary-class mean features.
+
+    Supplying ``extractor`` lets the caller reuse one fixed feature space across
+    similarity and nearest-neighbor analyses.  ``strict=True`` prevents a
+    paper run from silently switching to pooled pixels when pretrained weights
+    are unavailable.
+    """
     if not aux_datasets:
         return float("nan")
-    extractor = build_feature_extractor(device)
+    extractor = extractor or build_feature_extractor(device, strict=strict)
     target = dataset_mean_feature(target_dataset, extractor=extractor, batch_size=batch_size, device=device)
     sims = []
     for aux in aux_datasets:
