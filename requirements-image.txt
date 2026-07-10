@@ -9,3 +9,5 @@ matplotlib
 tqdm
 pillow
 scikit-learn
+scipy
+pytest

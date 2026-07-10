@@ -1,4 +1,5 @@
 image_transfer_results/
+image_transfer_results*/
 results_image*/
 /data/
 /datasets/
@@ -14,4 +15,6 @@ slurm-*.out
 *.err
 __pycache__/
 *.pyc
+.venv/
+.deps/
 results_T*/
