@@ -1,0 +1,99 @@
+# Publication-grid template only. Generating this grid does not launch jobs.
+# Target and auxiliary groups below are the pre-existing pilot groups; a final
+# paper must pre-audit and freeze multiple target groups before running.
+dataset: imagenet64
+use_fake_data: false
+data_root: ${DATA_ROOT}
+output_root: ${RESULTS_ROOT:-image_transfer_results}
+image_size: 64
+
+targets:
+  - name: French bulldog
+    synset: n02108915
+    auxiliary_sets:
+      close: [n02096585, n02110958, n02108089, n02085620, n02091032, n02099601]
+      medium: [n02123045, n02123159, n02124075, n02119022, n02114367]
+      far: [n03594945, n04146614, n03028079, n03457902, n03710193]
+
+data_split:
+  manifest_root: ${RESULTS_ROOT:-image_transfer_results}/manifests
+  data_split_seed: 0
+  target_eval_size: 500
+  target_val_size: 100
+  nested_training_subsets: true
+  eval_source: train_holdout
+  insufficient_data_action: skip
+
+# Ten paired repetitions are recommended for the final frozen design.
+seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+model_initialization_seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+training_seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+sampling_seeds: [1000]
+evaluation_seeds: [2000]
+training_protocols: [natural_compute_matched, target_exposure_matched]
+n0_values: [50, 100, 250, 500]
+K_aux_values: [1, 3, 5]
+auxiliary_ratio_values: [0.5, 1.0, 2.0, 4.0]
+m_per_aux_rule: equal_n0
+num_aux_set_draws: 3
+aux_draw_seed: 3000
+
+model: {base_channels: 128, channel_mults: [1, 2, 3, 4]}
+diffusion: {timesteps: 1000, schedule: cosine}
+optimizer: {lr: 0.0002}
+training:
+  protocol: natural_compute_matched
+  steps: 100000
+  batch_size: 64
+  target_batch_size: 64
+  auxiliary_batch_size: 64
+  auxiliary_loss_weight: 1.0
+  num_workers: 0
+  precision: amp
+  validation_interval: 1000
+  checkpoint_interval: 1000
+sampling: {sampler: ddim, steps: 250, batch_size: 64, ddim_eta: 0.0}
+num_generated: 5000
+
+experiments:
+  A: {enabled: true, n0_values: [50, 100, 250, 500], aux_sets: [close, medium, far, mix]}
+  # Only n0 values expected to remain feasible after the frozen holdouts belong here.
+  B:
+    enabled: false
+    n0_values: [50, 100]
+    aux_sets: [close, medium, far, mix]
+    K_aux_values: [1, 3, 5]
+    auxiliary_ratio_values: [0.5, 1.0]
+    skip_if_insufficient_target_images: true
+  C:
+    enabled: false
+    n0_values: [100]
+    K_aux_values: [5]
+    auxiliary_ratio_values: [1.0]
+    compositions: [close_only, mostly_close, balanced_mix, mostly_far, far_only]
+
+evaluation:
+  mode: paper
+  corruption_bank_root: ${RESULTS_ROOT:-image_transfer_results}/corruption_banks
+  corruptions_per_image: 4
+  noise_bins:
+    low: [0.0, 0.2]
+    mid: [0.2, 0.7]
+    high: [0.7, 1.0]
+  compute_fid: true
+  compute_kid: true
+  compute_prdc: true
+  compute_classifier_fidelity: true
+  compute_inception_score: false
+  compute_cmmd: false
+  compute_feature_similarity: true
+  make_nearest_neighbors: true
+  real_eval_max: 500
+  sampling_batch_size: 64
+  feature_batch_size: 64
+  fid_batch_size: 64
+  kid_subset_size: 100
+  kid_num_subsets: 100
+  prdc_k: 5
+  near_duplicate_threshold: 0.05
+  image_input_range: [-1, 1]

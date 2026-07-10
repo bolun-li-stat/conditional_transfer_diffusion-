@@ -1,3 +1,54 @@
-from .builders import DatasetBundle, build_datasets_for_job, count_available_target_images
+"""Image-transfer dataset APIs.
 
-__all__ = ["DatasetBundle", "build_datasets_for_job", "count_available_target_images"]
+Builder imports are lazy so pure manifest and job-grid tooling can run on login
+nodes that do not have PyTorch installed.
+"""
+
+from __future__ import annotations
+
+from .manifests import (
+    MANIFEST_SCHEMA_VERSION,
+    ManifestError,
+    ManifestInsufficientDataError,
+    auxiliary_training_subset,
+    build_data_manifest,
+    canonical_sha256,
+    config_hash,
+    equal_total_feasibility,
+    load_manifest,
+    manifest_path,
+    persist_or_validate_manifest,
+    target_training_subset,
+    validate_manifest,
+)
+
+__all__ = [
+    "DatasetBundle",
+    "build_datasets_for_job",
+    "count_available_target_images",
+    "MANIFEST_SCHEMA_VERSION",
+    "ManifestError",
+    "ManifestInsufficientDataError",
+    "build_data_manifest",
+    "canonical_sha256",
+    "config_hash",
+    "target_training_subset",
+    "auxiliary_training_subset",
+    "equal_total_feasibility",
+    "validate_manifest",
+    "load_manifest",
+    "manifest_path",
+    "persist_or_validate_manifest",
+]
+
+
+def __getattr__(name: str):
+    if name in {"DatasetBundle", "build_datasets_for_job", "count_available_target_images"}:
+        from .builders import DatasetBundle, build_datasets_for_job, count_available_target_images
+
+        return {
+            "DatasetBundle": DatasetBundle,
+            "build_datasets_for_job": build_datasets_for_job,
+            "count_available_target_images": count_available_target_images,
+        }[name]
+    raise AttributeError(name)
