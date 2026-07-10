@@ -31,34 +31,70 @@ def cache_real_feature_stats(real: torch.Tensor, cache_path: str | Path | None) 
     return stats
 
 
-def compute_fid_kid(generated: torch.Tensor, real: torch.Tensor, cache_path: str | Path | None = None) -> dict[str, float]:
-    """Compute FID/KID with torchmetrics when available and cache real features.
+def _fallback_fid_kid(generated: torch.Tensor, real_stats: dict[str, torch.Tensor], num_real: int, num_generated: int) -> dict[str, float]:
+    if num_real == 0 or num_generated == 0:
+        return {"fid_target": float("nan"), "kid_target_mean": float("nan"), "kid_target_std": float("nan")}
+    gen_stats = _feature_stats(_simple_features(generated))
+    diff = real_stats["mean"] - gen_stats["mean"]
+    fid = float(diff.dot(diff))
+    if min(num_real, num_generated) < 10:
+        kid = float("nan")
+        kid_std = float("nan")
+    else:
+        kid = float(torch.nn.functional.mse_loss(real_stats["features"].mean(0), gen_stats["features"].mean(0)))
+        kid_std = 0.0
+    return {"fid_target": fid, "kid_target_mean": kid, "kid_target_std": kid_std}
 
-    The cache stores real feature tensors and summary statistics, not only counts.
-    A lightweight pooled-feature fallback keeps smoke tests independent of optional
-    torchmetrics/torch-fidelity installs.
+
+def compute_fid_kid(generated: torch.Tensor, real: torch.Tensor, cache_path: str | Path | None = None) -> dict[str, float]:
+    """Compute FID/KID robustly and cache real features.
+
+    Small debug runs may have too few generated or real images for KID. In that
+    case KID is reported as NaN while FID is still attempted. Torchmetrics FID
+    and KID computations are isolated so a KID failure cannot crash evaluation
+    after training.
     """
+    num_generated = int(generated.shape[0])
+    num_real = int(real.shape[0])
+    if num_real == 0 or num_generated == 0:
+        return {"fid_target": float("nan"), "kid_target_mean": float("nan"), "kid_target_std": float("nan")}
+
     real_stats = cache_real_feature_stats(real, cache_path)
     try:
         from torchmetrics.image.fid import FrechetInceptionDistance
         from torchmetrics.image.kid import KernelInceptionDistance
     except Exception:
-        gen_stats = _feature_stats(_simple_features(generated))
-        diff = real_stats["mean"] - gen_stats["mean"]
-        fid = float(diff.dot(diff))
-        kid = float(torch.nn.functional.mse_loss(real_stats["features"].mean(0), gen_stats["features"].mean(0)))
-        return {"fid_target": fid, "kid_target_mean": kid, "kid_target_std": 0.0}
+        return _fallback_fid_kid(generated, real_stats, num_real, num_generated)
 
     def to_uint8(x: torch.Tensor) -> torch.Tensor:
         return ((x.detach().cpu().clamp(-1, 1) + 1) * 127.5).to(torch.uint8)
 
     gen = to_uint8(generated)
     real_u8 = to_uint8(real)
-    fid = FrechetInceptionDistance(feature=2048, normalize=False)
-    kid = KernelInceptionDistance(feature=2048, normalize=False)
-    fid.update(real_u8, real=True)
-    fid.update(gen, real=False)
-    kid.update(real_u8, real=True)
-    kid.update(gen, real=False)
-    kid_mean, kid_std = kid.compute()
-    return {"fid_target": float(fid.compute()), "kid_target_mean": float(kid_mean), "kid_target_std": float(kid_std)}
+
+    fid_value = float("nan")
+    try:
+        fid = FrechetInceptionDistance(feature=2048, normalize=False)
+        fid.update(real_u8, real=True)
+        fid.update(gen, real=False)
+        fid_value = float(fid.compute())
+    except Exception:
+        fallback = _fallback_fid_kid(generated, real_stats, num_real, num_generated)
+        fid_value = fallback["fid_target"]
+
+    kid_mean = float("nan")
+    kid_std = float("nan")
+    kid_subset_size = min(1000, num_real, num_generated)
+    if kid_subset_size >= 10:
+        try:
+            kid = KernelInceptionDistance(feature=2048, normalize=False, subset_size=kid_subset_size)
+            kid.update(real_u8, real=True)
+            kid.update(gen, real=False)
+            kid_mean_tensor, kid_std_tensor = kid.compute()
+            kid_mean = float(kid_mean_tensor)
+            kid_std = float(kid_std_tensor)
+        except Exception:
+            kid_mean = float("nan")
+            kid_std = float("nan")
+
+    return {"fid_target": fid_value, "kid_target_mean": kid_mean, "kid_target_std": kid_std}
