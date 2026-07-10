@@ -212,7 +212,7 @@ def run(args, job: dict | None = None) -> dict:
         if aux_batches:
             aux_real = torch.cat(aux_batches, dim=0)
     if cfg.get("evaluation", {}).get("make_nearest_neighbors", True):
-        make_nearest_neighbor_grid(samples.cpu(), real, aux_real, outdir / "figures" / f"{run_id}_nearest_neighbors.png", device=device)
+        make_nearest_neighbor_grid(samples.cpu(), real, aux_real, outdir / "figures" / f"{run_id}_nearest_neighbors.png", device=device, nn_batch_size=int(cfg.get("evaluation", {}).get("nn_batch_size", 64)))
     if cfg.get("evaluation", {}).get("compute_feature_similarity", experiment == "C") and bundle.aux_eval_datasets:
         row["average_auxiliary_similarity"] = average_auxiliary_similarity(bundle.target_eval, bundle.aux_eval_datasets, batch_size=int(cfg.get("training", {}).get("batch_size", 32)), device=device)
     else:

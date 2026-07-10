@@ -32,3 +32,4 @@ evaluation:
   eval_split: train_holdout
   sampling_batch_size: 64
   classifier_batch_size: 64
+  nn_batch_size: 64

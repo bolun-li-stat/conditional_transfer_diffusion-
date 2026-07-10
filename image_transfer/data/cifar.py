@@ -38,11 +38,11 @@ def class_id(name_or_id: str | int) -> int:
     return CIFAR10_CLASSES[name_or_id]
 
 
-def load_cifar10(root: str | Path, image_size: int, train: bool, download: bool = True):
+def load_cifar10(root: str | Path, image_size: int, train: bool, download: bool = True, eval_transform: bool = False):
     require_torchvision()
     if CIFAR10 is None:
         raise RuntimeError("torchvision.datasets.CIFAR10 is unavailable")
-    transform = build_train_transform(image_size) if train else build_eval_transform(image_size)
+    transform = build_eval_transform(image_size) if eval_transform else (build_train_transform(image_size) if train else build_eval_transform(image_size))
     return CIFAR10(root=str(root), train=train, download=download, transform=transform)
 
 

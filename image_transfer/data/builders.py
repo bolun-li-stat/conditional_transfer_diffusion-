@@ -96,6 +96,7 @@ def build_datasets_for_job(cfg: dict[str, Any], job: dict[str, Any] | None, *, n
 
     if dataset_name.startswith("cifar"):
         train_base = load_cifar10(data_root, image_size, train=True, download=bool(cfg.get("download", True)))
+        train_eval_base = load_cifar10(data_root, image_size, train=True, download=bool(cfg.get("download", True)), eval_transform=True)
         val_base = load_cifar10(data_root, image_size, train=False, download=bool(cfg.get("download", True)))
         target_id = class_id(target_synset)
         aux_ids = [class_id(aux) for aux in aux_synsets]
@@ -113,12 +114,12 @@ def build_datasets_for_job(cfg: dict[str, Any], job: dict[str, Any] | None, *, n
             used = set(train_indices)
             target_candidates = [i for i, y in enumerate(train_base.targets) if int(y) == target_id and i not in used]
             eval_indices = _sample_indices(target_candidates, min(eval_pool_size, len(target_candidates)), seed + 2, "CIFAR target train_holdout eval pool")
-            target_eval = RemappedDataset(Subset(train_base, eval_indices), [target_id], {target_id: 0})
+            target_eval = RemappedDataset(Subset(train_eval_base, eval_indices), [target_id], {target_id: 0})
             for i, aux_id in enumerate(aux_ids):
                 aux_candidates = [j for j, y in enumerate(train_base.targets) if int(y) == aux_id and j not in used]
                 aux_count = min(eval_pool_size // max(len(aux_ids), 1), len(aux_candidates))
                 aux_indices = _sample_indices(aux_candidates, aux_count, seed + 100 + i, "CIFAR auxiliary train_holdout eval pool") if aux_count else []
-                aux_eval.append(RemappedDataset(Subset(train_base, aux_indices), [aux_id], {aux_id: i + 1}))
+                aux_eval.append(RemappedDataset(Subset(train_eval_base, aux_indices), [aux_id], {aux_id: i + 1}))
         else:
             eval_count = min(eval_pool_size, sum(1 for y in val_base.targets if int(y) == target_id))
             eval_indices = indices_for_classes(val_base, [target_id], {target_id: eval_count}, seed + 2)
@@ -133,6 +134,7 @@ def build_datasets_for_job(cfg: dict[str, Any], job: dict[str, Any] | None, *, n
     validate_synsets(data_root, "train", class_labels)
     validate_synsets(data_root, "val", [target_synset])
     train_base = load_imagefolder(data_root, "train", image_size, train=True)
+    train_eval_base = load_imagefolder(data_root, "train", image_size, train=False)
     val_base = load_imagefolder(data_root, "val", image_size, train=False)
     counts = {target_synset: target_need if not conditional else n0}
     if conditional:
@@ -150,13 +152,13 @@ def build_datasets_for_job(cfg: dict[str, Any], job: dict[str, Any] | None, *, n
         target_old = train_base.class_to_idx[target_synset]
         target_candidates = [i for i, (_, y) in enumerate(train_base.samples) if y == target_old and i not in used]
         eval_indices = _sample_indices(target_candidates, min(eval_pool_size, len(target_candidates)), seed + 2, "ImageNet target train_holdout eval pool")
-        target_eval = RemappedImageFolder(Subset(train_base, eval_indices), {target_old: 0})
+        target_eval = RemappedImageFolder(Subset(train_eval_base, eval_indices), {target_old: 0})
         for i, aux in enumerate(aux_synsets):
             aux_old = train_base.class_to_idx.get(aux)
             aux_candidates = [j for j, (_, y) in enumerate(train_base.samples) if y == aux_old and j not in used]
             aux_count = min(eval_pool_size // max(len(aux_synsets), 1), len(aux_candidates))
             aux_indices = _sample_indices(aux_candidates, aux_count, seed + 100 + i, "ImageNet auxiliary train_holdout eval pool") if aux_count else []
-            aux_eval.append(RemappedImageFolder(Subset(train_base, aux_indices), {aux_old: i + 1} if aux_old is not None else {}))
+            aux_eval.append(RemappedImageFolder(Subset(train_eval_base, aux_indices), {aux_old: i + 1} if aux_old is not None else {}))
     else:
         eval_count = min(eval_pool_size, val_available)
         eval_indices, eval_map = indices_for_synsets(val_base, [target_synset], {target_synset: eval_count}, seed + 2)
