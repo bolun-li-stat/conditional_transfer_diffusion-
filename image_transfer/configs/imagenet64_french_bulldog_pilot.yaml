@@ -12,11 +12,21 @@ targets:
 K_aux: 5
 m_per_aux_rule: equal_n0
 seeds: [0, 1, 2]
+training_protocols: [natural_compute_matched]
+data_split:
+  manifest_root: ${RESULTS_ROOT:-image_transfer_results}/manifests
+  data_split_seed: 0
+  target_eval_size: 500
+  target_val_size: 100
+  nested_training_subsets: true
+  eval_source: train_holdout
+  insufficient_data_action: skip
 model: {base_channels: 64, channel_mults: [1, 2, 3, 4]}
 diffusion: {timesteps: 1000, schedule: cosine}
 optimizer: {lr: 0.0002}
-training: {steps: 100000, batch_size: 64, num_workers: 4, precision: amp, validation_interval: 1000}
+training: {steps: 100000, batch_size: 64, num_workers: 0, precision: amp, validation_interval: 1000}
 sampling_steps: 1000
+sampling: {sampler: ddpm, steps: 1000, batch_size: 64, ddim_eta: 0.0}
 num_generated: 5000
 experiments:
   A: {enabled: true, n0_values: [50, 100], aux_sets: [close, medium, far, mix]}
@@ -24,13 +34,26 @@ experiments:
   C: {enabled: false, n0_values: [100], compositions: [close_only, mostly_close, balanced_mix, mostly_far, far_only]}
 
 evaluation:
+  mode: paper
+  corruption_bank_root: ${RESULTS_ROOT:-image_transfer_results}/corruption_banks
+  corruptions_per_image: 2
+  compute_fid: true
+  compute_kid: true
+  compute_prdc: true
+  compute_classifier_fidelity: true
+  compute_inception_score: false
+  compute_cmmd: false
   compute_fid_kid: true
   compute_classifier: true
   compute_feature_similarity: true
   make_nearest_neighbors: true
-  real_eval_max: 1000
+  real_eval_max: 500
   eval_split: train_holdout
   sampling_batch_size: 64
   classifier_batch_size: 64
   nn_batch_size: 64
   fid_batch_size: 64
+  feature_batch_size: 64
+  kid_subset_size: 100
+  kid_num_subsets: 100
+  prdc_k: 5

@@ -28,6 +28,28 @@ class RemappedDataset(Dataset):
         return x, self.label_to_new[int(y)]
 
 
+class BlockLabeledDataset(Dataset):
+    """Assign deterministic class labels to contiguous blocks of a base dataset.
+
+    ``torchvision.FakeData`` does not expose stable class-index pools.  This
+    wrapper makes its sample identities suitable for manifest-based smoke tests
+    while leaving image generation lazy and deterministic.
+    """
+
+    def __init__(self, dataset: Dataset, block_size: int, num_classes: int) -> None:
+        self.dataset = dataset
+        self.block_size = int(block_size)
+        self.num_classes = int(num_classes)
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int):
+        image, _ = self.dataset[index]
+        label = min(int(index) // self.block_size, self.num_classes - 1)
+        return image, label
+
+
 def class_id(name_or_id: str | int) -> int:
     if isinstance(name_or_id, int):
         return name_or_id

@@ -7,7 +7,6 @@ class ImageUNet(nn.Module):
     def __init__(self, image_size=32, in_channels=3, base_channels=64, channel_mults=(1,2,2,4), num_classes: int | None=None, time_dim: int | None=None):
         super().__init__(); self.num_classes=num_classes; time_dim=time_dim or base_channels*4
         self.time_mlp=nn.Sequential(nn.Linear(base_channels,time_dim),nn.SiLU(),nn.Linear(time_dim,time_dim))
-        self.class_emb=nn.Embedding(num_classes,time_dim) if num_classes is not None else None
         chs=[base_channels*m for m in channel_mults]
         self.in_conv=nn.Conv2d(in_channels,chs[0],3,padding=1)
         self.downs=nn.ModuleList(); in_ch=chs[0]; res=image_size; skips=[]
@@ -22,6 +21,14 @@ class ImageUNet(nn.Module):
             if res==16: self.ups.append(AttentionBlock(ch))
             if ch != chs[0]: self.ups.append(nn.ConvTranspose2d(ch,ch,4,2,1)); res*=2
         self.out=nn.Sequential(nn.GroupNorm(min(8,chs[0]),chs[0]),nn.SiLU(),nn.Conv2d(chs[0],in_channels,3,padding=1))
+        # Keep the class-only parameter last.  ``nn.Module`` constructors consume
+        # the global torch RNG while initializing their parameters.  Constructing
+        # the embedding before the backbone therefore used to shift every shared
+        # parameter whenever conditioning was enabled (or ``num_classes``
+        # changed).  With the embedding last, resetting the same model seed before
+        # constructing a conditional and an unconditional U-Net gives bitwise
+        # identical values for every common state-dict key.
+        self.class_emb=nn.Embedding(num_classes,time_dim) if num_classes is not None else None
         self.base_channels=base_channels
     def forward(self,x,t,y=None):
         emb=self.time_mlp(timestep_embedding(t,self.base_channels))

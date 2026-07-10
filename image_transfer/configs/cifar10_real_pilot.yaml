@@ -1,0 +1,86 @@
+# Small real-data pilot; intentionally not a publication-scale grid.
+dataset: cifar10
+use_fake_data: false
+download: true
+data_root: ${DATA_ROOT:-data}
+output_root: ${RESULTS_ROOT:-image_transfer_results_cifar10_pilot}
+image_size: 32
+
+targets:
+  - name: dog
+    synset: dog
+    auxiliary_sets:
+      close: [cat, horse, deer, bird, frog]
+      medium: [automobile, truck, ship, airplane, cat]
+      far: [automobile, truck, ship, airplane, frog]
+  - name: automobile
+    synset: automobile
+    auxiliary_sets:
+      close: [truck, ship, airplane, dog, cat]
+      medium: [ship, airplane, horse, deer, bird]
+      far: [dog, cat, horse, deer, frog]
+
+data_split:
+  manifest_root: ${RESULTS_ROOT:-image_transfer_results_cifar10_pilot}/manifests
+  data_split_seed: 0
+  target_eval_size: 500
+  target_val_size: 100
+  nested_training_subsets: true
+  eval_source: official_test
+  insufficient_data_action: skip
+
+seeds: [0, 1, 2]
+model_initialization_seeds: [0, 1, 2]
+training_seeds: [0, 1, 2]
+sampling_seeds: [1000]
+evaluation_seeds: [2000]
+training_protocols: [natural_compute_matched]
+n0_values: [100, 250]
+K_aux_values: [3]
+auxiliary_ratio_values: [1.0]
+m_per_aux_rule: equal_n0
+num_aux_set_draws: 1
+aux_draw_seed: 3000
+
+model: {base_channels: 32, channel_mults: [1, 2, 2]}
+diffusion: {timesteps: 100, schedule: cosine}
+optimizer: {lr: 0.0002}
+training:
+  protocol: natural_compute_matched
+  steps: 2000
+  batch_size: 64
+  target_batch_size: 64
+  auxiliary_batch_size: 64
+  auxiliary_loss_weight: 1.0
+  num_workers: 0
+  precision: fp32
+  validation_interval: 200
+  checkpoint_interval: 200
+sampling: {sampler: ddim, steps: 50, batch_size: 64, ddim_eta: 0.0}
+num_generated: 1000
+
+experiments:
+  A: {enabled: true, n0_values: [100, 250], aux_sets: [close, far]}
+  B: {enabled: false, n0_values: [100], aux_sets: [close, medium, far, mix], skip_if_insufficient_target_images: true}
+  C: {enabled: false, n0_values: [250], compositions: [close_only, mostly_close, balanced_mix, mostly_far, far_only]}
+
+evaluation:
+  mode: debug
+  corruption_bank_root: ${RESULTS_ROOT:-image_transfer_results_cifar10_pilot}/corruption_banks
+  corruptions_per_image: 2
+  compute_fid: false
+  compute_kid: false
+  compute_prdc: false
+  compute_classifier_fidelity: false
+  classifier_unavailable_reason: No version-pinned CIFAR-10 classifier is bundled; ImageNet classifiers are never substituted
+  compute_inception_score: false
+  compute_cmmd: false
+  compute_feature_similarity: false
+  make_nearest_neighbors: true
+  real_eval_max: 500
+  sampling_batch_size: 64
+  feature_batch_size: 64
+  fid_batch_size: 64
+  kid_subset_size: 100
+  kid_num_subsets: 100
+  prdc_k: 5

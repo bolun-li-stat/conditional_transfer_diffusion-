@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import itertools
+import random
+
 IMAGENET_CLASSES = {
     "n02108915": "French bulldog",
     "n02096585": "Boston bull",
@@ -68,7 +72,80 @@ def composition_counts(name: str, k_aux: int) -> dict[str, int]:
     raise ValueError(f"Unknown auxiliary composition: {name}")
 
 
-def select_aux_synsets(auxiliary_sets: dict[str, list[str]], composition: str, k_aux: int) -> list[str]:
+def _candidate_combinations(auxiliary_sets: dict[str, list[str]], composition: str, k_aux: int) -> list[list[str]]:
+    """Enumerate all valid, within-draw unique auxiliary class sets."""
+
+    group_options: list[list[tuple[str, ...]]] = []
+    for group, count in composition_counts(composition, k_aux).items():
+        candidates = list(dict.fromkeys(auxiliary_sets.get(group, [])))
+        if len(candidates) < count:
+            raise ValueError(f"Composition {composition} needs {count} {group} classes, found {len(candidates)}")
+        group_options.append(list(itertools.combinations(candidates, count)))
+    combinations: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+    for grouped in itertools.product(*group_options):
+        selected = [synset for group in grouped for synset in group]
+        if len(selected) != k_aux or len(set(selected)) != k_aux:
+            continue
+        key = tuple(selected)
+        if key not in seen:
+            seen.add(key)
+            combinations.append(selected)
+    if not combinations:
+        raise ValueError(f"Composition {composition} has no valid unique {k_aux}-class draw")
+    return combinations
+
+
+def draw_aux_synset_combinations(
+    auxiliary_sets: dict[str, list[str]],
+    composition: str,
+    k_aux: int,
+    *,
+    num_draws: int,
+    aux_draw_seed: int,
+) -> tuple[list[list[str]], int]:
+    """Return reproducibly shuffled unique draws and the number available.
+
+    If the candidate pool permits fewer unique sets than requested, only the
+    actual unique sets are returned.  Callers can record ``available`` instead
+    of pretending that repeated rows are independent auxiliary draws.
+    """
+
+    candidates = _candidate_combinations(auxiliary_sets, composition, k_aux)
+    digest = hashlib.sha256(f"{aux_draw_seed}\0{composition}\0{k_aux}".encode("utf-8")).digest()
+    random.Random(int.from_bytes(digest[:8], "big")).shuffle(candidates)
+    requested = max(int(num_draws), 0)
+    return candidates[: min(requested, len(candidates))], len(candidates)
+
+
+def select_aux_synsets(
+    auxiliary_sets: dict[str, list[str]],
+    composition: str,
+    k_aux: int,
+    *,
+    aux_draw_seed: int | None = None,
+    aux_draw_id: int = 0,
+) -> list[str]:
+    """Select one auxiliary set, retaining the historical first-K default.
+
+    Supplying ``aux_draw_seed`` activates reproducible random draws.  Distinct
+    ``aux_draw_id`` values index a shuffled list of unique combinations.
+    """
+
+    if aux_draw_seed is not None:
+        draws, available = draw_aux_synset_combinations(
+            auxiliary_sets,
+            composition,
+            k_aux,
+            num_draws=int(aux_draw_id) + 1,
+            aux_draw_seed=int(aux_draw_seed),
+        )
+        if int(aux_draw_id) >= len(draws):
+            raise ValueError(
+                f"Auxiliary draw {aux_draw_id} unavailable for {composition}; only {available} unique combinations exist"
+            )
+        return draws[int(aux_draw_id)]
+
     selected: list[str] = []
     for group, count in composition_counts(composition, k_aux).items():
         candidates = auxiliary_sets.get(group, [])

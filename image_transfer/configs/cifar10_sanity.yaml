@@ -1,3 +1,5 @@
+# Deprecated compatibility alias. Use cifar10_fake_smoke.yaml; FakeData output
+# is pipeline validation only and must never be reported as an experiment.
 dataset: cifar10
 use_fake_data: true
 data_root: ${DATA_ROOT:-data}
@@ -26,6 +28,8 @@ diffusion: {timesteps: 10, schedule: linear}
 optimizer: {lr: 0.001}
 training: {steps: 2, batch_size: 4, num_workers: 0, precision: fp32, validation_interval: 1}
 sampling_steps: 2
+sampler: ddim
+sampling: {sampler: ddim, steps: 2, batch_size: 4, ddim_eta: 0.0}
 num_generated: 4
 experiments:
   A: {enabled: true, n0_values: [100, 250, 500], aux_sets: [close, medium, far, mix]}
@@ -33,5 +37,7 @@ experiments:
   C: {enabled: false, n0_values: [100], compositions: [close_only, mostly_close, balanced_mix, mostly_far, far_only]}
 
 evaluation:
+  mode: debug
   compute_fid_kid: false
   compute_classifier: false
+  make_nearest_neighbors: false
