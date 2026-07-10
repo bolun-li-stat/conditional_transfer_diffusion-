@@ -6,6 +6,14 @@ import os
 from types import SimpleNamespace
 
 from image_transfer.scripts.train_one import run
+from image_transfer.utils.io import (
+    get_git_sha,
+    load_valid_result,
+    load_yaml,
+    resolve_env_path,
+    run_result_path,
+    write_failure_result,
+)
 
 
 def main() -> None:
@@ -13,8 +21,9 @@ def main() -> None:
     parser.add_argument("--jobs-csv", required=True)
     parser.add_argument("--job-index", type=int, default=None)
     parser.add_argument("--device", default=None)
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--force", action="store_true")
+    restart = parser.add_mutually_exclusive_group()
+    restart.add_argument("--resume", action="store_true")
+    restart.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     index = args.job_index if args.job_index is not None else int(os.environ.get("SLURM_ARRAY_TASK_ID", "0"))
@@ -23,6 +32,22 @@ def main() -> None:
     if index < 0 or index >= len(rows):
         raise IndexError(f"job-index {index} out of range for {len(rows)} jobs")
     job = rows[index]
+    cfg = load_yaml(job["config_path"])
+    results_root = resolve_env_path(cfg.get("output_root"), "image_transfer_results")
+    run_id = job.get("run_id") or f"job_{index}"
+
+    # A checkpoint is only an intermediate artifact.  Workers skip exclusively
+    # when the canonical per-run result exists and passes schema validation.
+    result_path = run_result_path(results_root, run_id)
+    if result_path.exists() and not args.force:
+        try:
+            load_valid_result(result_path, expected_run_id=run_id)
+        except (OSError, ValueError):
+            pass
+        else:
+            print(f"skipped completed run: {result_path}")
+            return
+
     namespace = SimpleNamespace(
         config=job["config_path"],
         experiment=job["experiment"],
@@ -39,7 +64,19 @@ def main() -> None:
         force=args.force,
         dry_run=args.dry_run,
     )
-    run(namespace, job)
+    try:
+        run(namespace, job)
+    except BaseException as exception:
+        failure_path = write_failure_result(
+            results_root,
+            run_id,
+            exception,
+            config=cfg,
+            job=job,
+            git_sha=get_git_sha(),
+        )
+        print(f"failure record: {failure_path}")
+        raise
 
 
 if __name__ == "__main__":
