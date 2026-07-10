@@ -6,9 +6,9 @@ import argparse
 from pathlib import Path
 
 from image_transfer.diffusion import ImageDDIM, ImageDDPM
-from image_transfer.models.unet import ImageUNet
+from image_transfer.models.model_factory import build_image_model
 from image_transfer.scripts.train_one import _atomic_torch_save, sample_batched
-from image_transfer.training.checkpointing import load_checkpoint
+from image_transfer.training.checkpointing import _torch_load, load_checkpoint
 from image_transfer.utils.device import get_device
 from image_transfer.utils.io import load_yaml
 
@@ -33,12 +33,18 @@ def main() -> None:
 
     cfg = load_yaml(args.config)
     device = get_device(args.device)
-    image_size = int(cfg.get("image_size", 32))
-    model = ImageUNet(
+    checkpoint_payload = _torch_load(args.checkpoint, map_location="cpu")
+    checkpoint_metadata = checkpoint_payload.get("model_metadata") or {}
+    model_cfg = checkpoint_metadata.get("resolved_model_config") or cfg.get("model")
+    image_size = int(checkpoint_metadata.get("image_size", cfg.get("image_size", 32)))
+    conditional = bool(checkpoint_metadata.get("conditional", args.conditional))
+    num_classes = int(checkpoint_metadata.get("num_classes", args.num_classes))
+    model = build_image_model(
+        model_cfg,
         image_size=image_size,
-        base_channels=int(cfg.get("model", {}).get("base_channels", 64)),
-        channel_mults=cfg.get("model", {}).get("channel_mults", [1, 2, 2, 4]),
-        num_classes=args.num_classes if args.conditional else None,
+        conditional=conditional,
+        num_classes=max(num_classes, 1),
+        model_seed=0,
     ).to(device)
     load_checkpoint(args.checkpoint, model, map_location=device, use_ema=not args.raw)
 
@@ -68,7 +74,7 @@ def main() -> None:
         model,
         num_samples=args.num_samples,
         image_size=image_size,
-        conditional=args.conditional,
+        conditional=conditional,
         label=args.label,
         sampling_steps=steps,
         batch_size=batch_size,

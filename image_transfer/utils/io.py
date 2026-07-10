@@ -172,8 +172,8 @@ def validate_result_record(record: Mapping[str, Any], *, expected_run_id: str | 
             raise ValueError(f"Completed result metrics section is missing required field {key!r}")
     if metrics.get("evaluation_mode") == "debug" and "debug_pooled_pixel_distance" not in metrics:
         raise ValueError("Debug result is missing debug_pooled_pixel_distance")
-    if metrics.get("evaluation_mode") == "paper" and metrics.get("metric_backend") in {None, ""}:
-        raise ValueError("Paper result is missing metric_backend provenance")
+    if metrics.get("evaluation_mode") == "strict" and metrics.get("metric_backend") in {None, ""}:
+        raise ValueError("Strict result is missing metric_backend provenance")
 
 
 def normalize_result_record(record: Mapping[str, Any]) -> dict[str, Any]:

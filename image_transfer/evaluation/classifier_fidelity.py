@@ -79,7 +79,7 @@ def preflight_classifier_fidelity(
     dataset_name: str | None = None,
     synset_to_index: Mapping[str, int] | None = None,
 ) -> dict[str, str | int]:
-    """Validate mappings and initialize the pinned paper classifier weights."""
+    """Validate mappings and initialize the pinned study classifier weights."""
 
     inferred_dataset = _normalize_dataset_name(dataset_name, target_synset)
     if inferred_dataset in {"cifar", "cifar10"}:

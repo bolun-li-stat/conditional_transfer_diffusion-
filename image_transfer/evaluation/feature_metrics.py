@@ -1,4 +1,4 @@
-"""Publication-safe feature metrics for target-class image evaluation."""
+"""Strict feature metrics for target-class image evaluation."""
 
 from __future__ import annotations
 
@@ -19,11 +19,11 @@ FEATURE_METRIC_SCHEMA_VERSION = "2.0"
 
 
 class MetricBackendError(RuntimeError):
-    """Raised when a required paper-mode metric backend is unavailable."""
+    """Raised when a required strict-mode metric backend is unavailable."""
 
 
 class MetricComputationError(RuntimeError):
-    """Raised when a requested paper-mode metric fails to compute."""
+    """Raised when a requested strict-mode metric fails to compute."""
 
 
 def _package_version(name: str) -> str:
@@ -115,7 +115,7 @@ def cache_real_feature_stats(
 ) -> dict[str, Any]:
     """Compatibility helper that caches actual pooled-pixel features.
 
-    This helper is intentionally a debug primitive.  Paper-mode callers should
+    This helper is intentionally a debug primitive.  Strict-mode callers should
     use :func:`compute_feature_metrics`, whose cache key includes the manifest,
     extractor and preprocessing configuration.
     """
@@ -170,7 +170,7 @@ def _build_torchmetrics_extractor(feature_dimension: int, device: torch.device):
         from torchmetrics.image.fid import FrechetInceptionDistance
     except Exception as exc:
         raise MetricBackendError(
-            "paper evaluation requires torchmetrics with torch-fidelity support; "
+            "strict evaluation requires torchmetrics with torch-fidelity support; "
             "install requirements-image.txt and make the Inception weights available"
         ) from exc
     try:
@@ -178,7 +178,7 @@ def _build_torchmetrics_extractor(feature_dimension: int, device: torch.device):
         network = metric.inception.eval()
     except Exception as exc:
         raise MetricBackendError(
-            "could not initialize the publication FID/KID Inception feature extractor"
+            "could not initialize the strict FID/KID Inception feature extractor"
         ) from exc
     return network
 
@@ -188,7 +188,7 @@ def preflight_feature_metric_backend(
     feature_dimension: int = 2048,
     device: str | torch.device = "cpu",
 ) -> dict[str, str | int]:
-    """Initialize required paper weights before an expensive training run."""
+    """Initialize required strict-evaluation weights before an expensive training run."""
 
     network = _build_torchmetrics_extractor(int(feature_dimension), torch.device(device))
     del network
@@ -399,7 +399,7 @@ def compute_feature_metrics(
     generated: torch.Tensor,
     real: torch.Tensor,
     *,
-    mode: str = "paper",
+    mode: str = "strict",
     real_manifest_hash: str | None = None,
     cache_path: str | Path | None = None,
     cache_dir: str | Path | None = None,
@@ -424,18 +424,18 @@ def compute_feature_metrics(
 ) -> dict[str, Any]:
     """Compute one consistent feature-metric suite.
 
-    ``paper`` mode never substitutes another mathematical quantity when a
+    ``strict`` mode never substitutes another mathematical quantity when a
     backend fails.  ``debug`` mode performs only the fast pooled-pixel diagnostic
     and deliberately returns no ``fid_target`` or ``kid_target_*`` keys.
 
     A custom extractor, when supplied, must accept uint8 NCHW tensors in [0,255].
-    This injection point is useful for offline tests; publication runs should use
+    This injection point is useful for offline tests; main runs should use
     the recorded default Inception backend.
     """
 
     normalized_mode = str(mode).lower()
-    if normalized_mode not in {"paper", "debug"}:
-        raise ValueError("evaluation mode must be 'paper' or 'debug'")
+    if normalized_mode not in {"strict", "debug"}:
+        raise ValueError("evaluation mode must be 'strict' or 'debug'")
     if compute_prdc is not None and compute_prdc_metrics is not None and bool(compute_prdc) != bool(compute_prdc_metrics):
         raise ValueError("compute_prdc and compute_prdc_metrics aliases disagree")
     should_compute_prdc = (
@@ -446,18 +446,18 @@ def compute_feature_metrics(
     if generated.ndim != 4 or real.ndim != 4:
         raise ValueError("generated and real images must be NCHW tensors")
     if not real_manifest_hash:
-        if normalized_mode == "paper":
-            raise ValueError("paper mode requires real_manifest_hash")
+        if normalized_mode == "strict":
+            raise ValueError("strict mode requires real_manifest_hash")
         real_manifest_hash = "debug-untracked-real-images"
     if normalized_mode == "debug":
         return _debug_metrics(
             generated, real, manifest_hash=real_manifest_hash, cache_path=cache_path, cache_dir=cache_dir
         )
     if int(real.shape[0]) == 0 or int(generated.shape[0]) == 0:
-        raise ValueError("paper metrics require non-empty real and generated samples")
+        raise ValueError("strict metrics require non-empty real and generated samples")
     if metric_backend != "torchmetrics" and feature_extractor is None:
         raise MetricBackendError(
-            f"unsupported paper metric backend {metric_backend!r}; use 'torchmetrics' or inject a tested extractor"
+            f"unsupported strict metric backend {metric_backend!r}; use 'torchmetrics' or inject a tested extractor"
         )
 
     evaluation_device = torch.device(device)
@@ -503,12 +503,12 @@ def compute_feature_metrics(
     except MetricBackendError:
         raise
     except Exception as exc:
-        raise MetricComputationError("paper feature extraction failed; no fallback was used") from exc
+        raise MetricComputationError("strict feature extraction failed; no fallback was used") from exc
     if real_features.shape[1:] != generated_features.shape[1:]:
         raise MetricComputationError("real and generated feature dimensions differ")
 
     result: dict[str, Any] = {
-        "evaluation_mode": "paper",
+        "evaluation_mode": "strict",
         "metric_backend": "torchmetrics_inception_features" if feature_extractor is None else "provided_tested_extractor",
         "metric_backend_version": _package_version("torchmetrics") if feature_extractor is None else "provided",
         "metric_implementation": "internal_frechet_eigendecomposition+unbiased_polynomial_mmd+batched_prdc",

@@ -1,6 +1,6 @@
-# Publication-grid template only. Generating this grid does not launch jobs.
+# Main-grid template only. Generating this grid does not launch jobs.
 # Target and auxiliary groups below are the pre-existing pilot groups; a final
-# paper must pre-audit and freeze multiple target groups before running.
+# A final study must pre-audit and freeze multiple target groups before running.
 dataset: imagenet64
 use_fake_data: false
 data_root: ${DATA_ROOT}
@@ -38,9 +38,9 @@ m_per_aux_rule: equal_n0
 num_aux_set_draws: 3
 aux_draw_seed: 3000
 
-model: {base_channels: 128, channel_mults: [1, 2, 3, 4]}
+model: {architecture: adm_unet, profile: main_default}
 diffusion: {timesteps: 1000, schedule: cosine}
-optimizer: {lr: 0.0002}
+optimizer: {name: adamw, lr: 0.0002, betas: [0.9, 0.999], eps: 1.0e-8, weight_decay: 0.0}
 training:
   protocol: natural_compute_matched
   steps: 100000
@@ -50,6 +50,8 @@ training:
   auxiliary_loss_weight: 1.0
   num_workers: 0
   precision: amp
+  ema_decay: 0.9999
+  max_grad_norm: 1.0
   validation_interval: 1000
   checkpoint_interval: 1000
 sampling: {sampler: ddim, steps: 250, batch_size: 64, ddim_eta: 0.0}
@@ -73,7 +75,7 @@ experiments:
     compositions: [close_only, mostly_close, balanced_mix, mostly_far, far_only]
 
 evaluation:
-  mode: paper
+  mode: strict
   corruption_bank_root: ${RESULTS_ROOT:-image_transfer_results}/corruption_banks
   corruptions_per_image: 4
   noise_bins:

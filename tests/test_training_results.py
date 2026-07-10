@@ -215,7 +215,7 @@ def _result(run_id: str, model_type: str, seed: int, *, fid: float, top1: float)
             "total_examples_seen": 40 if "target_only" in model_type or model_type.startswith("unconditional") else 80,
         },
         "metrics": {
-            "evaluation_mode": "paper",
+            "evaluation_mode": "strict",
             "metric_backend": "offline-test",
             "num_generated": 100,
             "num_real_eval": 100,
