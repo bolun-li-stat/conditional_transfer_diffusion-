@@ -33,7 +33,7 @@ class _ResNetFeature(nn.Module):
 def build_feature_extractor(device="cpu", *, strict: bool = False) -> nn.Module:
     """Build the fixed ImageNet ResNet-50 extractor used for similarity/NNs.
 
-    ``strict=True`` is intended for paper runs and refuses a change of feature
+    ``strict=True`` is intended for strict runs and refuses a change of feature
     space.  The pooled-pixel fallback remains available only for legacy/debug
     smoke runs.
     """
@@ -78,7 +78,7 @@ def average_auxiliary_similarity(
 
     Supplying ``extractor`` lets the caller reuse one fixed feature space across
     similarity and nearest-neighbor analyses.  ``strict=True`` prevents a
-    paper run from silently switching to pooled pixels when pretrained weights
+    study run from silently switching to pooled pixels when pretrained weights
     are unavailable.
     """
     if not aux_datasets:

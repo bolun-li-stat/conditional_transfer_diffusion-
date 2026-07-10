@@ -41,7 +41,7 @@ def main() -> None:
     parser.add_argument("--evaluation-seed", type=int, default=0)
     parser.add_argument("--aux-composition", default="[]")
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--mode", choices=["paper", "debug"])
+    parser.add_argument("--mode", choices=["strict", "debug"])
     args = parser.parse_args()
 
     cfg = load_yaml(args.config)
@@ -70,7 +70,7 @@ def main() -> None:
         batch_size=int(evaluation_cfg.get("feature_batch_size", 64)),
     )
     device = get_device(args.device)
-    mode = args.mode or str(evaluation_cfg.get("mode", "paper"))
+    mode = args.mode or str(evaluation_cfg.get("mode", "strict"))
     metrics = compute_feature_metrics(
         samples,
         real,
@@ -97,7 +97,7 @@ def main() -> None:
                 dataset_name=str(cfg.get("dataset", "imagenet")),
                 device=device,
                 batch_size=int(evaluation_cfg.get("classifier_batch_size", 64)),
-                strict=mode == "paper",
+                strict=mode == "strict",
             )
         )
     else:

@@ -187,8 +187,8 @@ def test_paper_mode_backend_failure_raises_without_fallback(monkeypatch):
         compute_feature_metrics(
             torch.zeros(4, 3, 8, 8),
             torch.zeros(4, 3, 8, 8),
-            mode="paper",
-            real_manifest_hash="manifest-paper",
+            mode="strict",
+            real_manifest_hash="manifest-study",
         )
 
 
@@ -209,8 +209,8 @@ def test_unified_paper_metrics_with_injected_offline_extractor(tmp_path):
     result = compute_feature_metrics(
         generated,
         real,
-        mode="paper",
-        real_manifest_hash="manifest-paper",
+        mode="strict",
+        real_manifest_hash="manifest-study",
         cache_dir=tmp_path,
         feature_extractor=_TinyUint8Extractor(),
         feature_extractor_id="tiny-offline-test-v1",

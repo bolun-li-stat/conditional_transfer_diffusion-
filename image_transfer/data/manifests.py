@@ -26,7 +26,7 @@ class ManifestError(RuntimeError):
 
 
 class ManifestInsufficientDataError(ManifestError):
-    """Raised when a requested paper split or training subset is unavailable."""
+    """Raised when a requested study split or training subset is unavailable."""
 
     def __init__(self, message: str, *, details: Mapping[str, Any] | None = None) -> None:
         super().__init__(message)
@@ -86,7 +86,7 @@ def _reserve_exact(
     available = len(values)
     if available < requested:
         details = {"what": what, "requested": requested, "available": available, "shortfall": requested - available}
-        if mode == "paper":
+        if mode == "strict":
             raise ManifestInsufficientDataError(
                 f"{what} has {available} samples after earlier reservations; need {requested}",
                 details=details,
@@ -126,7 +126,7 @@ def build_data_manifest(
     auxiliary_eval_size: int = 100,
     experiment_family: str = "image_transfer",
     dataset_fingerprint: str | None = None,
-    mode: str = "paper",
+    mode: str = "strict",
     nested_training_subsets: bool = True,
 ) -> dict[str, Any]:
     """Create a canonical split manifest without any model-specific input.
@@ -137,8 +137,8 @@ def build_data_manifest(
     is exposed.  The remaining target order defines all nested ``n0`` subsets.
     """
 
-    if mode not in {"paper", "debug"}:
-        raise ValueError(f"Unknown manifest mode {mode!r}; expected 'paper' or 'debug'")
+    if mode not in {"strict", "debug"}:
+        raise ValueError(f"Unknown manifest mode {mode!r}; expected 'strict' or 'debug'")
     if target_class not in train_pools:
         raise ManifestError(f"Target class {target_class!r} is absent from train_pools")
     eval_source = str(eval_source)

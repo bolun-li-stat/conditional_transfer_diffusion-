@@ -33,7 +33,7 @@ def _manifest(**overrides):
         "target_val_size": 3,
         "auxiliary_eval_size": 2,
         "experiment_family": "A",
-        "mode": "paper",
+        "mode": "strict",
     }
     arguments.update(overrides)
     return build_data_manifest(**arguments)
