@@ -195,7 +195,7 @@ def run(args, job: dict | None = None) -> dict:
     real = torch.cat(real_batches, dim=0)[:real_eval_limit]
     row["num_real_eval"] = int(real.shape[0])
     if cfg.get("evaluation", {}).get("compute_fid_kid", True):
-        row.update(compute_fid_kid(samples.cpu(), real, outdir / "cache" / f"real_{target_synset}_{image_size}.pt"))
+        row.update(compute_fid_kid(samples.cpu(), real, outdir / "cache" / f"real_{target_synset}_{image_size}.pt", fid_batch_size=int(cfg.get("evaluation", {}).get("fid_batch_size", 64))))
     else:
         row.update({"fid_target": float("nan"), "kid_target_mean": float("nan"), "kid_target_std": float("nan")})
     if cfg.get("evaluation", {}).get("compute_classifier", False):

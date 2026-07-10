@@ -46,7 +46,12 @@ def _fallback_fid_kid(generated: torch.Tensor, real_stats: dict[str, torch.Tenso
     return {"fid_target": fid, "kid_target_mean": kid, "kid_target_std": kid_std}
 
 
-def compute_fid_kid(generated: torch.Tensor, real: torch.Tensor, cache_path: str | Path | None = None) -> dict[str, float]:
+def _update_metric_batched(metric, images: torch.Tensor, *, real: bool, batch_size: int) -> None:
+    for start in range(0, images.shape[0], batch_size):
+        metric.update(images[start : start + batch_size], real=real)
+
+
+def compute_fid_kid(generated: torch.Tensor, real: torch.Tensor, cache_path: str | Path | None = None, fid_batch_size: int = 64) -> dict[str, float]:
     """Compute FID/KID robustly and cache real features.
 
     Small debug runs may have too few generated or real images for KID. In that
@@ -75,8 +80,8 @@ def compute_fid_kid(generated: torch.Tensor, real: torch.Tensor, cache_path: str
     fid_value = float("nan")
     try:
         fid = FrechetInceptionDistance(feature=2048, normalize=False)
-        fid.update(real_u8, real=True)
-        fid.update(gen, real=False)
+        _update_metric_batched(fid, real_u8, real=True, batch_size=fid_batch_size)
+        _update_metric_batched(fid, gen, real=False, batch_size=fid_batch_size)
         fid_value = float(fid.compute())
     except Exception:
         fallback = _fallback_fid_kid(generated, real_stats, num_real, num_generated)
@@ -88,8 +93,8 @@ def compute_fid_kid(generated: torch.Tensor, real: torch.Tensor, cache_path: str
     if kid_subset_size >= 10:
         try:
             kid = KernelInceptionDistance(feature=2048, normalize=False, subset_size=kid_subset_size)
-            kid.update(real_u8, real=True)
-            kid.update(gen, real=False)
+            _update_metric_batched(kid, real_u8, real=True, batch_size=fid_batch_size)
+            _update_metric_batched(kid, gen, real=False, batch_size=fid_batch_size)
             kid_mean_tensor, kid_std_tensor = kid.compute()
             kid_mean = float(kid_mean_tensor)
             kid_std = float(kid_std_tensor)
