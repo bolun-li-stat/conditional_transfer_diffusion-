@@ -22,10 +22,10 @@ n0_values: [100, 250, 500]
 K_aux: 5
 m_per_aux_rule: equal_n0
 seeds: [0]
-model: {base_channels: 16, channel_mults: [1]}
+model: {architecture: adm_unet, profile: smoke_tiny}
 diffusion: {timesteps: 10, schedule: linear}
-optimizer: {lr: 0.001}
-training: {steps: 2, batch_size: 4, num_workers: 0, precision: fp32, validation_interval: 1}
+optimizer: {name: adamw, lr: 0.001, betas: [0.9, 0.999], eps: 1.0e-8, weight_decay: 0.0}
+training: {steps: 2, batch_size: 4, num_workers: 0, precision: fp32, validation_interval: 1, ema_decay: 0.999, max_grad_norm: 1.0}
 sampling_steps: 2
 sampler: ddim
 sampling: {sampler: ddim, steps: 2, batch_size: 4, ddim_eta: 0.0}
