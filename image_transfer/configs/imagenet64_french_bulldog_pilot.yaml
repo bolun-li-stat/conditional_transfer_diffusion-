@@ -29,3 +29,6 @@ evaluation:
   compute_feature_similarity: true
   make_nearest_neighbors: true
   real_eval_max: 1000
+  eval_split: train_holdout
+  sampling_batch_size: 64
+  classifier_batch_size: 64

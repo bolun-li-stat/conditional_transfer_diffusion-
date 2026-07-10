@@ -34,6 +34,16 @@ FIELDS = [
 ]
 
 
+
+def sample_batched(diffusion, model, *, num_samples: int, image_size: int, conditional: bool, label: int, sampling_steps: int, batch_size: int) -> torch.Tensor:
+    chunks = []
+    for start in range(0, num_samples, batch_size):
+        current = min(batch_size, num_samples - start)
+        labels = torch.full((current,), label, dtype=torch.long, device=diffusion.device) if conditional else None
+        chunk = diffusion.sample(model, (current, 3, image_size, image_size), y=labels, steps=sampling_steps)
+        chunks.append(chunk.cpu())
+    return torch.cat(chunks, dim=0) if chunks else torch.empty(0, 3, image_size, image_size)
+
 def read_job(path: str, index: int) -> dict[str, str]:
     with open(path, newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -160,10 +170,17 @@ def run(args, job: dict | None = None) -> dict:
 
     eval_start = time.time()
     num_generated = int(row["num_generated"])
-    labels = None
-    if not model_type.startswith("unconditional"):
-        labels = torch.zeros(num_generated, dtype=torch.long, device=diffusion.device)
-    samples = diffusion.sample(model, (num_generated, 3, image_size, image_size), y=labels, steps=int(row["sampling_steps"]))
+    sampling_batch_size = int(cfg.get("evaluation", {}).get("sampling_batch_size", cfg.get("sampling", {}).get("batch_size", cfg.get("training", {}).get("batch_size", 32))))
+    samples = sample_batched(
+        diffusion,
+        model,
+        num_samples=num_generated,
+        image_size=image_size,
+        conditional=not model_type.startswith("unconditional"),
+        label=0,
+        sampling_steps=int(row["sampling_steps"]),
+        batch_size=sampling_batch_size,
+    )
     sample_path = outdir / "samples" / f"{run_id}_samples.pt"
     ensure_dir(sample_path.parent)
     torch.save(samples.cpu(), sample_path)
@@ -182,7 +199,7 @@ def run(args, job: dict | None = None) -> dict:
     else:
         row.update({"fid_target": float("nan"), "kid_target_mean": float("nan"), "kid_target_std": float("nan")})
     if cfg.get("evaluation", {}).get("compute_classifier", False):
-        row.update(evaluate_classifier_fidelity(samples.cpu(), target_synset, bundle.aux_synsets, device=device))
+        row.update(evaluate_classifier_fidelity(samples.cpu(), target_synset, bundle.aux_synsets, device=device, batch_size=int(cfg.get("evaluation", {}).get("classifier_batch_size", cfg.get("training", {}).get("batch_size", 32)))))
     else:
         row.update({"classifier_target_top1_acc": float("nan"), "classifier_target_top5_acc": float("nan"), "auxiliary_leakage_rate": float("nan"), "top1_prediction_histogram_json": "{}"})
     aux_real = None

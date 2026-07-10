@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,15 @@ class DatasetBundle:
     skipped: bool = False
     skip_reason: str = ""
 
+
+
+def _sample_indices(candidates: list[int], count: int, seed: int, what: str) -> list[int]:
+    if len(candidates) < count:
+        raise ValueError(f"{what} has {len(candidates)} images, need {count}")
+    rng = random.Random(seed)
+    values = list(candidates)
+    rng.shuffle(values)
+    return values[:count]
 
 def _job_value(job: dict[str, Any] | None, key: str, default: Any = None) -> Any:
     if not job:
@@ -72,7 +82,9 @@ def build_datasets_for_job(cfg: dict[str, Any], job: dict[str, Any] | None, *, n
         target_need = n0 + k_aux * m_per_aux
     class_labels = [target_synset] + aux_synsets
 
-    eval_pool_size = int(cfg.get("evaluation", {}).get("real_eval_max", cfg.get("num_real_eval", 1000)))
+    eval_cfg = cfg.get("evaluation", {})
+    eval_pool_size = int(eval_cfg.get("real_eval_max", cfg.get("num_real_eval", 1000)))
+    eval_split = str(eval_cfg.get("eval_split", "val"))
 
     if cfg.get("use_fake_data", False):
         total = target_need if not conditional else n0 + len(aux_synsets) * m_per_aux
@@ -93,17 +105,28 @@ def build_datasets_for_job(cfg: dict[str, Any], job: dict[str, Any] | None, *, n
         train_indices = indices_for_classes(train_base, [target_id] + aux_ids, counts, seed)
         val_count = min(max(n0, 1), sum(1 for y in val_base.targets if int(y) == target_id))
         val_indices = indices_for_classes(val_base, [target_id], {target_id: val_count}, seed + 1)
-        eval_count = min(eval_pool_size, sum(1 for y in val_base.targets if int(y) == target_id))
-        eval_indices = indices_for_classes(val_base, [target_id], {target_id: eval_count}, seed + 2)
         label_to_new = {old: new for new, old in enumerate([target_id] + aux_ids)}
         train = RemappedDataset(Subset(train_base, train_indices), [target_id] + aux_ids, label_to_new)
         val = RemappedDataset(Subset(val_base, val_indices), [target_id], {target_id: 0})
-        target_eval = RemappedDataset(Subset(val_base, eval_indices), [target_id], {target_id: 0})
         aux_eval = []
-        for i, aux_id in enumerate(aux_ids):
-            aux_count = min(eval_pool_size // max(len(aux_ids), 1), sum(1 for y in val_base.targets if int(y) == aux_id))
-            aux_indices = indices_for_classes(val_base, [aux_id], {aux_id: aux_count}, seed + 100 + i) if aux_count else []
-            aux_eval.append(RemappedDataset(Subset(val_base, aux_indices), [aux_id], {aux_id: i + 1}))
+        if eval_split == "train_holdout":
+            used = set(train_indices)
+            target_candidates = [i for i, y in enumerate(train_base.targets) if int(y) == target_id and i not in used]
+            eval_indices = _sample_indices(target_candidates, min(eval_pool_size, len(target_candidates)), seed + 2, "CIFAR target train_holdout eval pool")
+            target_eval = RemappedDataset(Subset(train_base, eval_indices), [target_id], {target_id: 0})
+            for i, aux_id in enumerate(aux_ids):
+                aux_candidates = [j for j, y in enumerate(train_base.targets) if int(y) == aux_id and j not in used]
+                aux_count = min(eval_pool_size // max(len(aux_ids), 1), len(aux_candidates))
+                aux_indices = _sample_indices(aux_candidates, aux_count, seed + 100 + i, "CIFAR auxiliary train_holdout eval pool") if aux_count else []
+                aux_eval.append(RemappedDataset(Subset(train_base, aux_indices), [aux_id], {aux_id: i + 1}))
+        else:
+            eval_count = min(eval_pool_size, sum(1 for y in val_base.targets if int(y) == target_id))
+            eval_indices = indices_for_classes(val_base, [target_id], {target_id: eval_count}, seed + 2)
+            target_eval = RemappedDataset(Subset(val_base, eval_indices), [target_id], {target_id: 0})
+            for i, aux_id in enumerate(aux_ids):
+                aux_count = min(eval_pool_size // max(len(aux_ids), 1), sum(1 for y in val_base.targets if int(y) == aux_id))
+                aux_indices = indices_for_classes(val_base, [aux_id], {aux_id: aux_count}, seed + 100 + i) if aux_count else []
+                aux_eval.append(RemappedDataset(Subset(val_base, aux_indices), [aux_id], {aux_id: i + 1}))
         target_available = sum(1 for label in train_base.targets if int(label) == target_id)
         return DatasetBundle(train=train, val=val, target_eval=target_eval, class_labels=class_labels, aux_synsets=aux_synsets, total_train_images=len(train), num_target_available=target_available, aux_eval_datasets=aux_eval)
 
@@ -118,16 +141,29 @@ def build_datasets_for_job(cfg: dict[str, Any], job: dict[str, Any] | None, *, n
     target_available = sum(1 for _, y in train_base.samples if y == train_base.class_to_idx[target_synset])
     val_available = sum(1 for _, y in val_base.samples if y == val_base.class_to_idx[target_synset])
     val_count = min(max(n0, 1), val_available)
-    eval_count = min(eval_pool_size, val_available)
     val_indices, val_map = indices_for_synsets(val_base, [target_synset], {target_synset: val_count}, seed + 1)
-    eval_indices, eval_map = indices_for_synsets(val_base, [target_synset], {target_synset: eval_count}, seed + 2)
     train = RemappedImageFolder(Subset(train_base, train_indices), old_to_new)
     val = RemappedImageFolder(Subset(val_base, val_indices), val_map)
-    target_eval = RemappedImageFolder(Subset(val_base, eval_indices), eval_map)
     aux_eval = []
-    for i, aux in enumerate(aux_synsets):
-        aux_available = sum(1 for _, y in val_base.samples if y == val_base.class_to_idx.get(aux, -1))
-        aux_count = min(eval_pool_size // max(len(aux_synsets), 1), aux_available)
-        aux_indices, aux_map = indices_for_synsets(val_base, [aux], {aux: aux_count}, seed + 100 + i) if aux_count else ([], {})
-        aux_eval.append(RemappedImageFolder(Subset(val_base, aux_indices), aux_map))
+    if eval_split == "train_holdout":
+        used = set(train_indices)
+        target_old = train_base.class_to_idx[target_synset]
+        target_candidates = [i for i, (_, y) in enumerate(train_base.samples) if y == target_old and i not in used]
+        eval_indices = _sample_indices(target_candidates, min(eval_pool_size, len(target_candidates)), seed + 2, "ImageNet target train_holdout eval pool")
+        target_eval = RemappedImageFolder(Subset(train_base, eval_indices), {target_old: 0})
+        for i, aux in enumerate(aux_synsets):
+            aux_old = train_base.class_to_idx.get(aux)
+            aux_candidates = [j for j, (_, y) in enumerate(train_base.samples) if y == aux_old and j not in used]
+            aux_count = min(eval_pool_size // max(len(aux_synsets), 1), len(aux_candidates))
+            aux_indices = _sample_indices(aux_candidates, aux_count, seed + 100 + i, "ImageNet auxiliary train_holdout eval pool") if aux_count else []
+            aux_eval.append(RemappedImageFolder(Subset(train_base, aux_indices), {aux_old: i + 1} if aux_old is not None else {}))
+    else:
+        eval_count = min(eval_pool_size, val_available)
+        eval_indices, eval_map = indices_for_synsets(val_base, [target_synset], {target_synset: eval_count}, seed + 2)
+        target_eval = RemappedImageFolder(Subset(val_base, eval_indices), eval_map)
+        for i, aux in enumerate(aux_synsets):
+            aux_available = sum(1 for _, y in val_base.samples if y == val_base.class_to_idx.get(aux, -1))
+            aux_count = min(eval_pool_size // max(len(aux_synsets), 1), aux_available)
+            aux_indices, aux_map = indices_for_synsets(val_base, [aux], {aux: aux_count}, seed + 100 + i) if aux_count else ([], {})
+            aux_eval.append(RemappedImageFolder(Subset(val_base, aux_indices), aux_map))
     return DatasetBundle(train=train, val=val, target_eval=target_eval, class_labels=class_labels, aux_synsets=aux_synsets, total_train_images=len(train), num_target_available=target_available, aux_eval_datasets=aux_eval)

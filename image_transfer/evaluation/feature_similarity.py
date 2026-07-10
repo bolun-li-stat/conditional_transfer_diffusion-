@@ -7,7 +7,20 @@ from torch.utils.data import DataLoader
 
 class _FallbackFeature(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.adaptive_avg_pool2d(x.float(), (4, 4)).flatten(1)
+        x = ((x.float().clamp(-1, 1) + 1.0) / 2.0)
+        return torch.nn.functional.adaptive_avg_pool2d(x, (4, 4)).flatten(1)
+
+
+class _ResNetFeature(nn.Module):
+    def __init__(self, backbone: nn.Module, preprocess: nn.Module) -> None:
+        super().__init__()
+        self.preprocess = preprocess
+        self.features = nn.Sequential(*list(backbone.children())[:-1], nn.Flatten())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = ((x.float().clamp(-1, 1) + 1.0) / 2.0)
+        x = self.preprocess(x)
+        return self.features(x)
 
 
 def build_feature_extractor(device="cpu") -> nn.Module:
@@ -18,7 +31,7 @@ def build_feature_extractor(device="cpu") -> nn.Module:
         return _FallbackFeature().to(device).eval()
     weights = ResNet50_Weights.DEFAULT
     model = resnet50(weights=weights)
-    return nn.Sequential(*list(model.children())[:-1], nn.Flatten()).to(device).eval()
+    return _ResNetFeature(model, weights.transforms()).to(device).eval()
 
 
 @torch.no_grad()
