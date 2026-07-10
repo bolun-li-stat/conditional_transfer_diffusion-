@@ -1,0 +1,37 @@
+dataset: cifar10
+use_fake_data: false
+data_root: ${DATA_ROOT:-data}
+output_root: ${RESULTS_ROOT:-image_transfer_results_cifar_real}
+image_size: 32
+targets:
+  - name: dog
+    synset: dog
+    auxiliary_sets:
+      close: [cat, horse, deer, bird, frog]
+      medium: [automobile, truck, ship, airplane, cat]
+      far: [automobile, truck, ship, airplane, frog]
+  - name: automobile
+    synset: automobile
+    auxiliary_sets:
+      close: [truck, ship, airplane, dog, cat]
+      medium: [ship, airplane, horse, deer, bird]
+      far: [dog, cat, horse, deer, frog]
+experiments_to_run: [A]
+n0_values: [100, 250, 500]
+K_aux: 5
+m_per_aux_rule: equal_n0
+seeds: [0]
+model: {base_channels: 16, channel_mults: [1]}
+diffusion: {timesteps: 10, schedule: linear}
+optimizer: {lr: 0.001}
+training: {steps: 2, batch_size: 4, num_workers: 0, precision: fp32, validation_interval: 1}
+sampling_steps: 2
+num_generated: 4
+experiments:
+  A: {enabled: true, n0_values: [100, 250, 500], aux_sets: [close, medium, far, mix]}
+  B: {enabled: false, n0_values: [100], aux_sets: [close, medium, far, mix], skip_if_insufficient_target_images: true}
+  C: {enabled: false, n0_values: [100], compositions: [close_only, mostly_close, balanced_mix, mostly_far, far_only]}
+
+evaluation:
+  compute_fid_kid: false
+  compute_classifier: false
