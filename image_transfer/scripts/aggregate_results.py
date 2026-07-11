@@ -61,6 +61,7 @@ PAIR_KEY_COLUMNS = [
     "m_per_aux",
     "K_aux",
     "baseline_target_count",
+    "architecture_profile",
     "data_split_seed",
     "model_initialization_seed",
     "training_seed",
@@ -77,10 +78,12 @@ BASELINE_PAIR_KEY_COLUMNS = [
     "target_synset",
     "n0",
     "baseline_target_count",
+    "architecture_profile",
     "data_split_seed",
     "model_initialization_seed",
     "training_seed",
     "training_protocol",
+    "architecture_profile",
     "sampling_seed",
     "evaluation_seed",
     "sampler",
@@ -227,6 +230,7 @@ def _normalize_columns(frame: pd.DataFrame) -> pd.DataFrame:
         "config_hash": "",
         "effective_run_spec_hash": "",
         "sampling_steps": 0,
+        "architecture_profile": "legacy",
     }
     for key, value in defaults.items():
         if key not in result:

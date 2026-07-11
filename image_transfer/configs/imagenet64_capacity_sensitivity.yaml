@@ -1,0 +1,44 @@
+# Small, non-default capacity sensitivity design. Do not expand to the full main grid.
+dataset: imagenet64
+use_fake_data: false
+data_root: ${DATA_ROOT}
+output_root: ${RESULTS_ROOT:-image_transfer_results_capacity}
+image_size: 64
+targets:
+  - name: French bulldog
+    synset: n02108915
+    auxiliary_sets:
+      close: [n02096585, n02110958, n02108089, n02085620, n02091032, n02099601]
+      far: [n03594945, n04146614, n03028079, n03457902, n03710193]
+data_split:
+  manifest_root: ${RESULTS_ROOT:-image_transfer_results_capacity}/manifests
+  data_split_seed: 0
+  target_eval_size: 500
+  target_val_size: 100
+  nested_training_subsets: true
+  eval_source: train_holdout
+  insufficient_data_action: skip
+seeds: [0, 1, 2]
+n0_values: [50, 100]
+K_aux_values: [3]
+auxiliary_ratio_values: [1.0]
+training_protocols: [natural_compute_matched]
+capacity_profiles: [pilot_small, main_default, capacity_large]
+model: {architecture: adm_unet, profile: main_default}
+diffusion: {timesteps: 1000, schedule: cosine}
+optimizer: {name: adamw, lr: 0.0002, betas: [0.9, 0.999], eps: 1.0e-8, weight_decay: 0.0}
+training: {steps: 100000, batch_size: 64, num_workers: 0, precision: amp, validation_interval: 1000, ema_decay: 0.9999, max_grad_norm: 1.0}
+sampling: {sampler: ddim, steps: 100, batch_size: 64, ddim_eta: 0.0}
+num_generated: 5000
+experiments:
+  A: {enabled: true, n0_values: [50, 100], aux_sets: [close, far]}
+evaluation:
+  mode: strict
+  compute_fid: true
+  compute_kid: true
+  compute_prdc: true
+  compute_classifier_fidelity: true
+  compute_inception_score: false
+  compute_feature_similarity: true
+  make_nearest_neighbors: true
+  real_eval_max: 500

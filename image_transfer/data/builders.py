@@ -126,7 +126,7 @@ def _split_settings(cfg: Mapping[str, Any], *, num_auxiliary_classes: int) -> di
         "target_eval_size": eval_size,
         "target_val_size": val_size,
         "auxiliary_eval_size": int(split.get("auxiliary_eval_size", aux_eval_default)),
-        "mode": str(evaluation.get("mode", "debug" if cfg.get("use_fake_data", False) else "paper")),
+        "mode": str(evaluation.get("mode", "debug" if cfg.get("use_fake_data", False) else "strict")),
         "nested_training_subsets": bool(split.get("nested_training_subsets", True)),
     }
 

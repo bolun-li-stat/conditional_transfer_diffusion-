@@ -21,10 +21,10 @@ data_split:
   nested_training_subsets: true
   eval_source: train_holdout
   insufficient_data_action: skip
-model: {base_channels: 128, channel_mults: [1, 2, 3, 4]}
+model: {architecture: adm_unet, profile: main_default}
 diffusion: {timesteps: 1000, schedule: cosine}
-optimizer: {lr: 0.0002}
-training: {steps: 100000, batch_size: 64, num_workers: 0, precision: amp, validation_interval: 1000}
+optimizer: {name: adamw, lr: 0.0002, betas: [0.9, 0.999], eps: 1.0e-8, weight_decay: 0.0}
+training: {steps: 100000, batch_size: 64, num_workers: 0, precision: amp, validation_interval: 1000, ema_decay: 0.9999, max_grad_norm: 1.0}
 sampling_steps: 1000
 sampling: {sampler: ddpm, steps: 1000, batch_size: 64, ddim_eta: 0.0}
 num_generated: 5000
@@ -34,7 +34,7 @@ experiments:
   C: {enabled: false, n0_values: [100], compositions: [close_only, mostly_close, balanced_mix, mostly_far, far_only]}
 
 evaluation:
-  mode: paper
+  mode: strict
   corruption_bank_root: ${RESULTS_ROOT:-image_transfer_results}/corruption_banks
   corruptions_per_image: 4
   compute_fid: true

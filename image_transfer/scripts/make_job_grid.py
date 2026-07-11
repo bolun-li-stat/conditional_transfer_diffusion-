@@ -31,6 +31,7 @@ JOB_FIELDS = [
     "total_auxiliary_budget",
     "auxiliary_ratio",
     "baseline_target_count",
+    "architecture_profile",
     "seed",  # legacy alias for training_seed
     "data_split_seed",
     "model_initialization_seed",
@@ -197,6 +198,7 @@ def _run_id(row: Mapping[str, Any]) -> str:
         f"mi{row['model_initialization_seed']}",
         f"tr{row['training_seed']}",
         row["training_protocol"],
+        row.get("architecture_profile", "legacy"),
         row["sampler"],
         f"ss{row['sampling_seed']}",
         f"ev{row['evaluation_seed']}",
@@ -246,6 +248,7 @@ def _row(
         "total_auxiliary_budget": int(total_auxiliary_budget),
         "auxiliary_ratio": float(m_per_aux / n0) if n0 else 0.0,
         "baseline_target_count": int(n0 + total_auxiliary_budget) if exp == "B" else int(n0),
+        "architecture_profile": str(cfg.get("model", {}).get("profile", "legacy")),
         "seed": int(seeds["training_seed"]),
         **{name: int(value) for name, value in seeds.items()},
         "training_protocol": training_protocol,
@@ -371,6 +374,19 @@ def rows_for_experiment(exp: str, cfg: dict[str, Any], config_path: str) -> list
                                     aux_draw_seed=draw_seed,
                                     aux_unique_combinations=available,
                                 ))
+
+    capacity_profiles = [str(value) for value in cfg.get("capacity_profiles", [])]
+    if capacity_profiles:
+        rows = [
+            {
+                **row,
+                "architecture_profile": profile,
+            }
+            for row in rows
+            for profile in capacity_profiles
+        ]
+        for row in rows:
+            row["run_id"] = _run_id(row)
 
     unique: dict[str, dict[str, Any]] = {}
     for row in rows:

@@ -15,6 +15,7 @@ from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler, Subset
 
 from image_transfer.diffusion.ddpm import ImageDDPM
 from image_transfer.evaluation.denoising_loss import evaluate_denoising_bins
+from image_transfer.models.model_factory import build_image_model, model_parameter_metadata
 from image_transfer.models.unet import ImageUNet
 from image_transfer.training.checkpointing import checkpoint_paths, load_training_checkpoint, save_checkpoint
 from image_transfer.training.ema import EMA
@@ -352,13 +353,19 @@ def train_image_model(
     conditional: bool,
     num_classes: int,
     image_size: int,
-    base_channels: int,
-    channel_mults: list[int] | tuple[int, ...],
+    base_channels: int | None = None,
+    channel_mults: list[int] | tuple[int, ...] | None = None,
+    model_cfg: dict[str, Any] | None = None,
     timesteps: int,
     schedule: str,
     steps: int,
     batch_size: int,
     lr: float,
+    optimizer_name: str = "adamw",
+    optimizer_betas: tuple[float, float] = (0.9, 0.999),
+    optimizer_eps: float = 1.0e-8,
+    weight_decay: float = 0.0,
+    max_grad_norm: float | None = None,
     device,
     precision: str = "fp32",
     ema_decay: float = 0.999,
@@ -367,7 +374,7 @@ def train_image_model(
     resume: bool = False,
     validation_interval: int = 100,
     num_workers: int = 0,
-    # Publication-grade extensions; all are optional for old callers.
+    # Rigorous extensions; all are optional for old callers.
     target_dataset=None,
     auxiliary_dataset=None,
     training_protocol: str = "natural_compute_matched",
@@ -404,12 +411,22 @@ def train_image_model(
         raise ValueError("auxiliary_loss_weight must be non-negative")
     device = torch.device(device)
 
-    def build_model() -> ImageUNet:
-        return ImageUNet(
+    def build_model():
+        if model_cfg is None:
+            # Historical Python callers retain the old constructor contract;
+            # all YAML-driven runs go through the validated model factory.
+            return ImageUNet(
+                image_size=image_size,
+                base_channels=int(base_channels or 64),
+                channel_mults=tuple(channel_mults or [1, 2, 2, 4]),
+                num_classes=num_classes if conditional else None,
+            ).to(device)
+        return build_image_model(
+            model_cfg,
             image_size=image_size,
-            base_channels=base_channels,
-            channel_mults=tuple(channel_mults),
-            num_classes=num_classes if conditional else None,
+            conditional=conditional,
+            num_classes=num_classes,
+            model_seed=int(model_initialization_seed or 0),
         ).to(device)
 
     if model_initialization_seed is None:
@@ -418,8 +435,26 @@ def train_image_model(
         with isolated_seed(model_initialization_seed, deterministic=deterministic_cpu and device.type == "cpu"):
             model = build_model()
     diffusion = ImageDDPM(timesteps=timesteps, schedule=schedule, device=device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    if str(optimizer_name).lower() != "adamw":
+        raise ValueError("Only optimizer.name='adamw' is currently supported")
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(lr),
+        betas=tuple(float(value) for value in optimizer_betas),
+        eps=float(optimizer_eps),
+        weight_decay=float(weight_decay),
+    )
     ema = EMA(model, ema_decay)
+    architecture_metadata = model_parameter_metadata(model)
+    architecture_metadata.update(
+        {
+            "conditional": bool(conditional),
+            "num_classes": int(num_classes if conditional else 0),
+            "image_size": int(image_size),
+            "in_channels": int(architecture_metadata["resolved_model_config"].get("in_channels", 3)),
+            "out_channels": int(architecture_metadata["resolved_model_config"].get("out_channels", 3)),
+        }
+    )
     scaler = _new_grad_scaler(precision == "amp" and device.type == "cuda")
 
     last_path, best_path, legacy_alias = checkpoint_paths(
@@ -448,6 +483,8 @@ def train_image_model(
             map_location=device,
             expected_config_hash=config_hash,
             expected_manifest_hash=manifest_hash,
+            expected_model_config_hash=architecture_metadata["model_config_hash"],
+            expected_architecture=architecture_metadata["architecture"],
             restore_rng=True,
         )
         saved_protocol = checkpoint.get("training_protocol")
@@ -527,6 +564,8 @@ def train_image_model(
     final_loss = float("nan")
     final_target_loss = float("nan")
     final_auxiliary_loss = float("nan")
+    final_grad_norm = float("nan")
+    gradient_clipping_count = 0
     denoise = {key: float("nan") for key in ("all", "low", "mid", "high", "standard_error", "num_validation_images", "num_corruptions")}
     last_validation_step = -1
     start_time = time.time()
@@ -572,6 +611,7 @@ def train_image_model(
             training_protocol=training_protocol,
             protocol_metadata=protocol_metadata(current_step),
             data_state={"sampler_seed": sampler_seed, "global_step": current_step, "num_workers": num_workers},
+            model_metadata=architecture_metadata,
         )
 
     for step in range(start_step, steps):
@@ -622,6 +662,12 @@ def train_image_model(
                     counters["auxiliary_examples_seen_by_class"][key] = counters["auxiliary_examples_seen_by_class"].get(key, 0) + int(count)
 
         scaler.scale(loss).backward()
+        if max_grad_norm is not None:
+            scaler.unscale_(optimizer)
+            grad_norm_tensor = torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
+            final_grad_norm = float(grad_norm_tensor.detach().cpu())
+            if math.isfinite(final_grad_norm) and final_grad_norm > float(max_grad_norm):
+                gradient_clipping_count += 1
         scaler.step(optimizer)
         scaler.update()
         ema.update(model)
@@ -705,6 +751,14 @@ def train_image_model(
         "final_train_loss": final_loss,
         "final_target_train_loss": final_target_loss,
         "final_auxiliary_train_loss": final_auxiliary_loss,
+        "final_gradient_norm": final_grad_norm,
+        "gradient_clipping_count": int(gradient_clipping_count),
+        "max_grad_norm": max_grad_norm,
+        "optimizer_name": "adamw",
+        "optimizer_betas": list(optimizer_betas),
+        "optimizer_eps": float(optimizer_eps),
+        "optimizer_weight_decay": float(weight_decay),
+        "ema_decay": float(ema_decay),
         "wallclock_train_seconds": train_seconds,
         "validation_epsilon_mse_target": denoise["all"],
         "validation_epsilon_mse_low_noise": denoise["low"],
@@ -721,4 +775,5 @@ def train_image_model(
         "best_validation_epsilon_mse_target": reported_best,
         "last_checkpoint_path": str(last_path) if last_path is not None else "",
         "best_checkpoint_path": str(best_path) if best_path is not None else "",
+        **{key: value for key, value in architecture_metadata.items() if key != "resolved_model_config"},
     }

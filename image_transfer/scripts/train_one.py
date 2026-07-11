@@ -1,4 +1,4 @@
-"""Train, sample, and evaluate one publication-grade image-transfer job."""
+"""Train, sample, and evaluate one rigorous image-transfer job."""
 
 from __future__ import annotations
 
@@ -44,6 +44,7 @@ from image_transfer.evaluation.nearest_neighbors import (
     compute_memorization_diagnostics,
     make_memorization_grid,
 )
+from image_transfer.models.model_factory import model_config_hash, resolve_model_config
 from image_transfer.scripts.make_job_grid import EXP_DIR
 from image_transfer.training.checkpointing import load_checkpoint
 from image_transfer.training.trainer import train_image_model
@@ -391,6 +392,9 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
                 n0 + m_per_aux * k_aux if experiment == "B" else n0,
             )
         ),
+        "architecture_profile": str(
+            _arg_or_job(args, job, "architecture_profile", cfg.get("model", {}).get("profile", "legacy"))
+        ),
         "seed": training_seed,
         "data_split_seed": data_split_seed,
         "model_initialization_seed": model_initialization_seed,
@@ -495,9 +499,24 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
         print(f"skipped {run_id}: insufficient target images after fixed holdouts")
         return record
 
+    run_model_cfg = dict(cfg.get("model") or {})
+    if job_fields["architecture_profile"] != "legacy":
+        run_model_cfg["profile"] = job_fields["architecture_profile"]
+    resolved_model_config = resolve_model_config(run_model_cfg, image_size=image_size)
+    resolved_model_hash = model_config_hash(resolved_model_config)
     ensure_dir(run_config_path.parent)
     with open(run_config_path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump({"config": cfg, "job": builder_job, "run_id": run_id}, handle, sort_keys=False)
+        yaml.safe_dump(
+            {
+                "config": cfg,
+                "resolved_model_config": resolved_model_config,
+                "model_config_hash": resolved_model_hash,
+                "job": builder_job,
+                "run_id": run_id,
+            },
+            handle,
+            sort_keys=False,
+        )
 
     timesteps = int(cfg.get("diffusion", {}).get("timesteps", 1000))
     schedule = str(cfg.get("diffusion", {}).get("schedule", "linear"))
@@ -530,7 +549,7 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
     device = get_device(_arg_or_job(args, job, "device", cfg.get("device", "auto")))
     batch_size = int(training_cfg.get("batch_size", 32))
     conditional = _is_conditional(model_type)
-    mode = str(evaluation_cfg.get("mode", "debug" if cfg.get("use_fake_data", False) else "paper")).lower()
+    mode = str(evaluation_cfg.get("mode", "debug" if cfg.get("use_fake_data", False) else "strict")).lower()
     classifier_enabled = bool(
         evaluation_cfg.get("compute_classifier_fidelity", evaluation_cfg.get("compute_classifier", False))
     )
@@ -546,9 +565,9 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
             resolved_mapping = Path(args.config).resolve().parent / resolved_mapping
         classifier_mapping = load_synset_index_mapping(resolved_mapping)
 
-    # Paper runs fail on missing metric/classifier/diagnostic weights before
+    # Strict runs fail on missing metric/classifier/diagnostic weights before
     # spending compute on training. Debug mode remains fully offline-capable.
-    if mode == "paper":
+    if mode == "strict":
         preflight_feature_metric_backend(
             feature_dimension=int(evaluation_cfg.get("feature_dimension", 2048)),
             device=device,
@@ -572,16 +591,22 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
         conditional=conditional,
         num_classes=max(len(bundle.class_labels), 1),
         image_size=image_size,
-        base_channels=int(cfg.get("model", {}).get("base_channels", 64)),
-        channel_mults=cfg.get("model", {}).get("channel_mults", [1, 2, 2, 4]),
+        model_cfg=run_model_cfg,
         timesteps=timesteps,
         schedule=schedule,
         steps=training_steps,
         batch_size=batch_size,
         lr=float(cfg.get("optimizer", {}).get("lr", 2e-4)),
+        optimizer_name=str(cfg.get("optimizer", {}).get("name", "adamw")),
+        optimizer_betas=tuple(cfg.get("optimizer", {}).get("betas", [0.9, 0.999])),
+        optimizer_eps=float(cfg.get("optimizer", {}).get("eps", 1.0e-8)),
+        weight_decay=float(cfg.get("optimizer", {}).get("weight_decay", 0.0)),
         device=device,
         precision=str(training_cfg.get("precision", "fp32")),
         ema_decay=float(training_cfg.get("ema_decay", 0.999)),
+        max_grad_norm=(
+            None if training_cfg.get("max_grad_norm") is None else float(training_cfg["max_grad_norm"])
+        ),
         train_log_path=train_log_path,
         resume=bool(getattr(args, "resume", False)),
         validation_interval=int(training_cfg.get("validation_interval", 100)),
@@ -690,13 +715,13 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
             device=device,
             batch_size=int(evaluation_cfg.get("classifier_batch_size", batch_size)),
             synset_to_index=classifier_mapping,
-            strict=mode == "paper",
+            strict=mode == "strict",
         )
     else:
         classifier_metrics = _disabled_classifier_metrics(evaluation_cfg)
 
     shared_diagnostic_extractor = (
-        build_feature_extractor(device, strict=mode == "paper")
+        build_feature_extractor(device, strict=mode == "strict")
         if compute_similarity or compute_neighbors
         else None
     )
@@ -707,7 +732,7 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
             batch_size=int(evaluation_cfg.get("feature_batch_size", batch_size)),
             device=device,
             extractor=shared_diagnostic_extractor,
-            strict=mode == "paper",
+            strict=mode == "strict",
         )
     else:
         average_similarity = float("nan")
@@ -754,7 +779,7 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
             distance_batch_size=int(evaluation_cfg.get("distance_batch_size", 256)),
             reference_batch_size=int(evaluation_cfg.get("reference_batch_size", 1024)),
             extractor=shared_diagnostic_extractor,
-            strict_feature_extractor=mode == "paper",
+            strict_feature_extractor=mode == "strict",
         )
         nearest_neighbor_grid_path = str(outdir / "figures" / f"{run_id}_nearest_neighbors.png")
         fixed_indices = evaluation_cfg.get("nearest_neighbor_generated_indices")
@@ -769,7 +794,7 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
             distance_batch_size=int(evaluation_cfg.get("distance_batch_size", 256)),
             reference_batch_size=int(evaluation_cfg.get("reference_batch_size", 1024)),
             extractor=shared_diagnostic_extractor,
-            strict_feature_extractor=mode == "paper",
+            strict_feature_extractor=mode == "strict",
         )
 
     target_subset_count = n0 + k_aux * m_per_aux if model_type in EQUAL_TOTAL_MODEL_TYPES else n0
@@ -832,6 +857,12 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
             else "disabled"
         ),
         "diagnostic_torchvision_version": _package_version("torchvision"),
+        "architecture": train_metrics.get("architecture"),
+        "architecture_profile": train_metrics.get("architecture_profile"),
+        "model_parameter_count": train_metrics.get("model_parameter_count"),
+        "backbone_parameter_count": train_metrics.get("backbone_parameter_count"),
+        "conditioning_parameter_count": train_metrics.get("conditioning_parameter_count"),
+        "model_config_hash": train_metrics.get("model_config_hash"),
     }
     record = {
         "status": "completed",

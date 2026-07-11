@@ -37,7 +37,7 @@ def compute_fid_kid(
     cache_path: str | Path | None = None,
     fid_batch_size: int = 64,
     *,
-    mode: str = "paper",
+    mode: str = "strict",
     real_manifest_hash: str | None = None,
     kid_subset_size: int = 100,
     kid_num_subsets: int = 100,
