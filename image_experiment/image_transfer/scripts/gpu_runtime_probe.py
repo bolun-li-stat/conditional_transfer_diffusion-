@@ -11,7 +11,12 @@ import torch
 
 from image_transfer.config import load_resolved_config
 from image_transfer.scripts.inspect_environment import inspect_environment, validate_environment_report
-from image_transfer.training.runtime_probe import PROTOCOLS, RUNTIME_PROBE_SCHEMA_VERSION, run_load_probe
+from image_transfer.training.runtime_probe import (
+    GPU_MINIMUM_FREE_FORMULA,
+    PROTOCOLS,
+    RUNTIME_PROBE_SCHEMA_VERSION,
+    run_load_probe,
+)
 from image_transfer.utils.io import atomic_write_json, canonical_json_hash, get_git_sha, load_json, utc_timestamp
 
 
@@ -68,12 +73,16 @@ def run_gpu_probe(
             )
     if cuda:
         for protocol, result in results.items():
-            if int(result.get("gpu_headroom_bytes", -1)) < minimum_headroom:
+            estimated_free = int(result.get("estimated_minimum_free_during_step_bytes", -1))
+            if estimated_free < minimum_headroom:
                 failures.append(
                     {
                         "protocol": protocol,
                         "exception_type": "InsufficientGPUHeadroom",
-                        "message": f"configured minimum is {minimum_headroom} bytes",
+                        "message": (
+                            f"conservative free-memory estimate {estimated_free} bytes is below "
+                            f"the configured minimum {minimum_headroom} bytes"
+                        ),
                         "resolved_config_hash": resolved.resolved_hash,
                     }
                 )
@@ -93,6 +102,8 @@ def run_gpu_probe(
         "environment_runtime_hash": environment["environment_runtime_hash"],
         "environment_report_hash": environment["environment_report_hash"],
         "minimum_gpu_headroom_bytes": minimum_headroom,
+        "minimum_gpu_headroom_semantics": "estimated_minimum_free_during_step_bytes",
+        "estimated_minimum_free_during_step_formula": GPU_MINIMUM_FREE_FORMULA,
         "protocol_results": results,
         "runtime_probe_failures": failures,
     }

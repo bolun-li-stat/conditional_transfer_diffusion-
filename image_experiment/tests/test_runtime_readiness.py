@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,9 +16,13 @@ from image_transfer.environment_lock import (
     validate_exact_environment_lock,
 )
 from image_transfer.scripts.inspect_environment import inspect_environment, validate_environment_report
+from image_transfer.scripts import gpu_runtime_probe
+from image_transfer.scripts.validate_release_pilot import _gpu_memory_validation_errors
 from image_transfer.training import trainer
 from image_transfer.training.checkpointing import _torch_load, _atomic_torch_save
 from image_transfer.training.runtime_probe import (
+    _cuda_memory_snapshot,
+    _gpu_memory_details,
     maximum_configured_num_classes,
     run_load_probe,
     run_resume_roundtrip,
@@ -154,6 +159,126 @@ def test_configured_load_probe_records_finite_training_step(protocol, expected_a
     assert result["ema_updated"] is True
     assert result["gradient_clipping_configured"] is True
     assert result["step_finite"] is True
+    assert result["gpu_memory_measurement_status"] == "not_applicable"
+    assert result["gpu_total_memory_bytes"] == 0
+    assert result["actual_free_memory_before_bytes"] == 0
+    assert result["actual_free_memory_after_step_bytes"] == 0
+    assert result["peak_process_memory_allocated_bytes"] == 0
+    assert result["peak_process_memory_reserved_bytes"] == 0
+    assert result["process_capacity_headroom_bytes"] == 0
+    assert result["estimated_minimum_free_during_step_bytes"] == 0
+
+
+def test_cuda_memory_metrics_separate_actual_free_from_process_capacity(monkeypatch):
+    calls = []
+    memory_values = iter([(700, 1000), (650, 1000)])
+
+    def mem_get_info(device):
+        calls.append(device)
+        return next(memory_values)
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", mem_get_info)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: 250)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda device: 400)
+    device = torch.device("cuda")
+
+    before, total = _cuda_memory_snapshot(device)
+    details = _gpu_memory_details(
+        device,
+        actual_free_memory_before_bytes=before,
+        gpu_total_memory_bytes=total,
+    )
+
+    assert calls == [device, device]
+    assert details == {
+        "gpu_memory_measurement_status": "measured",
+        "gpu_total_memory_bytes": 1000,
+        "actual_free_memory_before_bytes": 700,
+        "actual_free_memory_after_step_bytes": 650,
+        "peak_process_memory_allocated_bytes": 250,
+        "peak_process_memory_reserved_bytes": 400,
+        "process_capacity_headroom_bytes": 600,
+        "estimated_minimum_free_during_step_bytes": 300,
+    }
+    assert details["process_capacity_headroom_bytes"] != details[
+        "estimated_minimum_free_during_step_bytes"
+    ]
+
+
+def test_gpu_probe_threshold_uses_conservative_free_memory(monkeypatch):
+    config = {
+        "training": {"minimum_gpu_headroom_bytes": 500},
+        "exact_environment_lock_path": "unused",
+    }
+    resolved = SimpleNamespace(resolved=config, resolved_hash="resolved", model_hash="model")
+    environment = {
+        "environment_runtime_hash": "runtime",
+        "environment_report_hash": "report",
+    }
+    monkeypatch.setattr(gpu_runtime_probe, "load_resolved_config", lambda path: resolved)
+    monkeypatch.setattr(gpu_runtime_probe, "load_json", lambda path: environment)
+    monkeypatch.setattr(gpu_runtime_probe, "validate_environment_report", lambda report: None)
+    monkeypatch.setattr(gpu_runtime_probe.torch.cuda, "is_available", lambda: True)
+
+    def load_result(config, *, device, protocol):
+        return {
+            "step_finite": True,
+            "process_capacity_headroom_bytes": 10_000,
+            "estimated_minimum_free_during_step_bytes": 400,
+        }
+
+    monkeypatch.setattr(gpu_runtime_probe, "run_load_probe", load_result)
+    report = gpu_runtime_probe.run_gpu_probe(
+        "config.yaml", environment_report_path="environment.json"
+    )
+    assert report["passed"] is False
+    assert report["minimum_gpu_headroom_semantics"] == (
+        "estimated_minimum_free_during_step_bytes"
+    )
+    assert "actual_free_memory_before_bytes" in report[
+        "estimated_minimum_free_during_step_formula"
+    ]
+    assert {
+        failure["exception_type"] for failure in report["runtime_probe_failures"]
+    } == {"InsufficientGPUHeadroom"}
+
+
+def test_release_memory_validation_rejects_old_or_miscomputed_fields():
+    assert _gpu_memory_validation_errors(
+        {
+            "gpu_total_memory_bytes": 1000,
+            "actual_free_memory_before_bytes": 700,
+            "actual_free_memory_after_step_bytes": 650,
+            "peak_process_memory_allocated_bytes": 250,
+            "peak_process_memory_reserved_bytes": 400,
+            "process_capacity_headroom_bytes": 600,
+            "estimated_minimum_free_during_step_bytes": 300,
+            "gpu_memory_measurement_status": "measured",
+        },
+        minimum_free_bytes=250,
+    ) == []
+    old_schema_result = {
+        "gpu_total_memory_bytes": 1000,
+        "peak_gpu_memory_reserved_bytes": 400,
+        "gpu_headroom_bytes": 600,
+    }
+    errors = _gpu_memory_validation_errors(old_schema_result, minimum_free_bytes=250)
+    assert "actual_free_memory_before_bytes" in errors
+    assert "estimated_minimum_free_during_step_bytes" in errors
+
+    insufficient = {
+        "gpu_total_memory_bytes": 1000,
+        "actual_free_memory_before_bytes": 700,
+        "actual_free_memory_after_step_bytes": 650,
+        "peak_process_memory_allocated_bytes": 250,
+        "peak_process_memory_reserved_bytes": 400,
+        "process_capacity_headroom_bytes": 600,
+        "estimated_minimum_free_during_step_bytes": 300,
+        "gpu_memory_measurement_status": "measured",
+    }
+    assert "estimated_minimum_free_threshold" in _gpu_memory_validation_errors(
+        insufficient, minimum_free_bytes=301
+    )
 
 
 def test_environment_report_double_hash_detects_tampering(tmp_path):

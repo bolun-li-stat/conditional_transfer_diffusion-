@@ -18,7 +18,11 @@ from image_transfer.readiness import enforce_readiness_gate
 from image_transfer.scripts.inspect_environment import inspect_environment, validate_environment_report
 from image_transfer.scripts.make_job_grid import job_breakdown, rows_for_experiment
 from image_transfer.scripts.prepare_metric_assets import initialize_backends_offline, verify_manifest
-from image_transfer.training.runtime_probe import PROTOCOLS, run_load_probe
+from image_transfer.training.runtime_probe import (
+    PROTOCOLS,
+    RUNTIME_PROBE_SCHEMA_VERSION,
+    run_load_probe,
+)
 from image_transfer.utils.io import atomic_write_json, atomic_write_text, load_json, resolve_env_path
 
 
@@ -247,7 +251,7 @@ def run_preflight(
                 probe = load_json(probe_path)
                 protocol_results = probe.get("protocol_results") or {}
                 probe_ok = bool(
-                    probe.get("schema_version") == "3.0"
+                    probe.get("schema_version") == RUNTIME_PROBE_SCHEMA_VERSION
                     and probe.get("probe_type") == probe_type
                     and probe.get("passed") is True
                     and probe.get("resolved_config_hash") == resolved.resolved_hash

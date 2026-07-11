@@ -45,4 +45,6 @@ python -m image_transfer.scripts.preflight_experiment \
 
 `readiness/pilot_status.json` is checked in with schema 3 and status `not_run`. A real validation run is the only operation that may write `passed`. The validator requires exact environment/runtime hashes, dataset identity, GPU load and resume probes, every expected result and pair, and checkpoint/sample/metric/figure/provenance artifacts. That status means engineering health only; it does not support a scientific conclusion. Main-stage configs reject a missing, failed, or provenance-mismatched status unless the explicit override is used and recorded.
 
-The current repository state is code-ready for a real-data release pilot only. No full ImageNet run, real-data metric improvement, or general transfer conclusion is claimed.
+The GPU load evidence itself uses runtime-probe schema 4. The validator requires actual free-memory snapshots from `torch.cuda.mem_get_info()`, process peak allocated/reserved memory, the separate process-capacity diagnostic, and the conservative `estimated_minimum_free_during_step_bytes`. The configured minimum-memory gate applies only to that conservative estimate. Older probe schemas or reports that expose only total-minus-process-reservation cannot pass current readiness validation.
+
+The current repository state is code-ready for target-cluster GPU and real-data release-pilot validation only. No real GPU probe, GPU resume probe, full ImageNet run, real-data metric improvement, or general transfer conclusion is claimed.

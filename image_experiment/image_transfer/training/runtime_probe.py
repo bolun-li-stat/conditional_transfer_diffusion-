@@ -19,7 +19,11 @@ from image_transfer.training.ema import EMA
 from image_transfer.utils.seed import set_seed
 
 
-RUNTIME_PROBE_SCHEMA_VERSION = "3.0"
+RUNTIME_PROBE_SCHEMA_VERSION = "4.0"
+GPU_MINIMUM_FREE_FORMULA = (
+    "max(0, min(actual_free_memory_after_step_bytes, "
+    "actual_free_memory_before_bytes - peak_process_memory_reserved_bytes))"
+)
 PROTOCOLS = ("natural_compute_matched", "target_exposure_matched")
 
 
@@ -150,6 +154,55 @@ def _step(
     }
 
 
+def _cuda_memory_snapshot(device: torch.device) -> tuple[int, int]:
+    """Return actual free and total device memory reported by the CUDA driver."""
+
+    free, total = torch.cuda.mem_get_info(device)
+    return int(free), int(total)
+
+
+def _gpu_memory_details(
+    device: torch.device,
+    *,
+    actual_free_memory_before_bytes: int,
+    gpu_total_memory_bytes: int,
+) -> dict[str, int | str]:
+    """Summarize process capacity separately from conservative actual free memory.
+
+    ``total - peak_reserved`` describes the capacity of this process in an
+    otherwise empty device.  It does not account for the driver, CUDA context,
+    or other processes, so the readiness threshold uses the conservative free
+    memory estimate instead.
+    """
+
+    actual_free_after, total_after = _cuda_memory_snapshot(device)
+    if total_after != int(gpu_total_memory_bytes):
+        raise RuntimeError(
+            "CUDA total memory changed during the load probe: "
+            f"{gpu_total_memory_bytes} -> {total_after}"
+        )
+    peak_allocated = int(torch.cuda.max_memory_allocated(device))
+    peak_reserved = int(torch.cuda.max_memory_reserved(device))
+    process_capacity = max(0, int(gpu_total_memory_bytes) - peak_reserved)
+    estimated_minimum_free = max(
+        0,
+        min(
+            actual_free_after,
+            int(actual_free_memory_before_bytes) - peak_reserved,
+        ),
+    )
+    return {
+        "gpu_memory_measurement_status": "measured",
+        "gpu_total_memory_bytes": int(gpu_total_memory_bytes),
+        "actual_free_memory_before_bytes": int(actual_free_memory_before_bytes),
+        "actual_free_memory_after_step_bytes": actual_free_after,
+        "peak_process_memory_allocated_bytes": peak_allocated,
+        "peak_process_memory_reserved_bytes": peak_reserved,
+        "process_capacity_headroom_bytes": process_capacity,
+        "estimated_minimum_free_during_step_bytes": estimated_minimum_free,
+    }
+
+
 def run_load_probe(
     config: dict[str, Any],
     *,
@@ -182,6 +235,10 @@ def run_load_probe(
         schedule=str(diffusion_cfg.get("schedule", "linear")),
         device=resolved_device,
     )
+    if resolved_device.type == "cuda":
+        actual_free_before, total_memory = _cuda_memory_snapshot(resolved_device)
+    else:
+        actual_free_before, total_memory = 0, 0
     details = _step(
         model=model,
         diffusion=diffusion,
@@ -199,26 +256,26 @@ def run_load_probe(
     details["num_classes"] = num_classes
     if resolved_device.type == "cuda":
         properties = torch.cuda.get_device_properties(resolved_device)
-        peak_allocated = int(torch.cuda.max_memory_allocated(resolved_device))
-        peak_reserved = int(torch.cuda.max_memory_reserved(resolved_device))
-        total = int(properties.total_memory)
+        details["gpu_name"] = properties.name
         details.update(
-            {
-                "gpu_name": properties.name,
-                "gpu_total_memory_bytes": total,
-                "peak_gpu_memory_allocated_bytes": peak_allocated,
-                "peak_gpu_memory_reserved_bytes": peak_reserved,
-                "gpu_headroom_bytes": max(0, total - peak_reserved),
-            }
+            _gpu_memory_details(
+                resolved_device,
+                actual_free_memory_before_bytes=actual_free_before,
+                gpu_total_memory_bytes=total_memory,
+            )
         )
     else:
         details.update(
             {
                 "gpu_name": "not_applicable",
+                "gpu_memory_measurement_status": "not_applicable",
                 "gpu_total_memory_bytes": 0,
-                "peak_gpu_memory_allocated_bytes": 0,
-                "peak_gpu_memory_reserved_bytes": 0,
-                "gpu_headroom_bytes": 0,
+                "actual_free_memory_before_bytes": 0,
+                "actual_free_memory_after_step_bytes": 0,
+                "peak_process_memory_allocated_bytes": 0,
+                "peak_process_memory_reserved_bytes": 0,
+                "process_capacity_headroom_bytes": 0,
+                "estimated_minimum_free_during_step_bytes": 0,
             }
         )
     return details
@@ -462,6 +519,7 @@ def run_resume_roundtrip(
 __all__ = [
     "PROTOCOLS",
     "RUNTIME_PROBE_SCHEMA_VERSION",
+    "GPU_MINIMUM_FREE_FORMULA",
     "maximum_configured_num_classes",
     "run_load_probe",
     "run_resume_roundtrip",

@@ -22,7 +22,11 @@ from image_transfer.data.manifests import canonical_sha256
 from image_transfer.evaluation.corruption_bank import load_corruption_bank
 from image_transfer.scripts.inspect_environment import validate_environment_report
 from image_transfer.scripts.make_job_grid import JOB_FIELDS, RUN_SPEC_FIELDS, rows_for_experiment
-from image_transfer.training.runtime_probe import PROTOCOLS
+from image_transfer.training.runtime_probe import (
+    GPU_MINIMUM_FREE_FORMULA,
+    PROTOCOLS,
+    RUNTIME_PROBE_SCHEMA_VERSION,
+)
 from image_transfer.utils.io import atomic_write_json, canonical_json_hash, load_json, load_valid_result, resolve_env_path
 
 
@@ -55,6 +59,52 @@ def _finite(value: Any) -> bool:
         return math.isfinite(float(value))
     except (TypeError, ValueError):
         return False
+
+
+def _gpu_memory_validation_errors(
+    result: Mapping[str, Any], *, minimum_free_bytes: int
+) -> list[str]:
+    fields = (
+        "gpu_total_memory_bytes",
+        "actual_free_memory_before_bytes",
+        "actual_free_memory_after_step_bytes",
+        "peak_process_memory_allocated_bytes",
+        "peak_process_memory_reserved_bytes",
+        "process_capacity_headroom_bytes",
+        "estimated_minimum_free_during_step_bytes",
+    )
+    errors: list[str] = []
+    values: dict[str, int] = {}
+    for field in fields:
+        value = result.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            errors.append(field)
+        else:
+            values[field] = value
+    if len(values) != len(fields):
+        return errors
+
+    total = values["gpu_total_memory_bytes"]
+    before = values["actual_free_memory_before_bytes"]
+    after = values["actual_free_memory_after_step_bytes"]
+    allocated = values["peak_process_memory_allocated_bytes"]
+    reserved = values["peak_process_memory_reserved_bytes"]
+    process_capacity = values["process_capacity_headroom_bytes"]
+    estimated_free = values["estimated_minimum_free_during_step_bytes"]
+    if total <= 0 or before > total or after > total:
+        errors.append("actual_free_memory_range")
+    if allocated > reserved:
+        errors.append("peak_process_memory_order")
+    if process_capacity != max(0, total - reserved):
+        errors.append("process_capacity_headroom_formula")
+    expected_estimate = max(0, min(after, before - reserved))
+    if estimated_free != expected_estimate:
+        errors.append("estimated_minimum_free_formula")
+    if estimated_free < int(minimum_free_bytes):
+        errors.append("estimated_minimum_free_threshold")
+    if result.get("gpu_memory_measurement_status") != "measured":
+        errors.append("gpu_memory_measurement_status")
+    return errors
 
 
 def _enabled_experiments(config: Mapping[str, Any]) -> list[str]:
@@ -705,7 +755,10 @@ def _validate_external_runtime_evidence(
             expected_probe_hash = canonical_json_hash(
                 {key: value for key, value in probe.items() if key not in {"created_at", "probe_hash"}}
             )
-            if probe.get("schema_version") != "3.0" or probe.get("probe_type") != probe_type:
+            if (
+                probe.get("schema_version") != RUNTIME_PROBE_SCHEMA_VERSION
+                or probe.get("probe_type") != probe_type
+            ):
                 failures.append(f"runtime_probe:{probe_type}:schema")
             if probe.get("probe_hash") != expected_probe_hash:
                 failures.append(f"runtime_probe:{probe_type}:hash")
@@ -727,6 +780,11 @@ def _validate_external_runtime_evidence(
             if probe_type == "gpu_load":
                 if probe.get("cuda_available") is not True:
                     failures.append("runtime_probe:gpu_load:cuda")
+                if (
+                    probe.get("estimated_minimum_free_during_step_formula")
+                    != GPU_MINIMUM_FREE_FORMULA
+                ):
+                    failures.append("runtime_probe:gpu_load:memory_formula")
                 training = config.get("training") or {}
                 minimum_headroom = int(training.get("minimum_gpu_headroom_bytes", 0))
                 for protocol in PROTOCOLS:
@@ -744,8 +802,12 @@ def _validate_external_runtime_evidence(
                         failures.append(f"runtime_probe:gpu_load:{protocol}:target_batch_size")
                     if int(result.get("auxiliary_batch_size", -1)) != expected_auxiliary:
                         failures.append(f"runtime_probe:gpu_load:{protocol}:auxiliary_batch_size")
-                    if int(result.get("gpu_headroom_bytes", -1)) < minimum_headroom:
-                        failures.append(f"runtime_probe:gpu_load:{protocol}:headroom")
+                    for memory_error in _gpu_memory_validation_errors(
+                        result, minimum_free_bytes=minimum_headroom
+                    ):
+                        failures.append(
+                            f"runtime_probe:gpu_load:{protocol}:{memory_error}"
+                        )
                     if str(training.get("precision", "fp32")) == "amp" and not (
                         result.get("amp_enabled") and result.get("grad_scaler_enabled")
                     ):

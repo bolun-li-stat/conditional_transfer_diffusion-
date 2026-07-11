@@ -23,6 +23,20 @@ python -m image_transfer.scripts.inspect_environment \
 
 After the report passes, run the configured GPU load probe and real resume probe. The load probe exercises actual batches for both protocols with AMP, GradScaler, AdamW, clipping, and EMA; the resume probe rebuilds state and continues training after a checkpoint reload. CPU smoke output is never marked as GPU evidence.
 
+GPU load reports use runtime-probe schema 4. For each protocol they record the CUDA driver's actual free memory before the step and after synchronization, together with the process peak allocated/reserved memory. `process_capacity_headroom_bytes = gpu_total_memory_bytes - peak_process_memory_reserved_bytes` is retained only as a process-capacity diagnostic; it is not actual system free memory. The conservative readiness quantity is
+
+```text
+estimated_minimum_free_during_step_bytes = max(
+    0,
+    min(
+        actual_free_memory_after_step_bytes,
+        actual_free_memory_before_bytes - peak_process_memory_reserved_bytes,
+    ),
+)
+```
+
+`training.minimum_gpu_headroom_bytes` is compared with that conservative free-memory estimate. This accounts for pre-existing and shared-node usage more safely than subtracting this process's peak reservation from total capacity. CPU probes record zero-valued memory fields with `gpu_memory_measurement_status: not_applicable`; they cannot satisfy release GPU evidence.
+
 Metric weights are evaluation assets, not model initialization. Prepare them outside array workers and verify them offline. The asset manifest records relative filename, byte size, SHA256, and package versions. Missing or modified assets make strict preflight fail rather than trigger a compute-node download.
 
 Use a dedicated `TORCH_HOME` and an explicit manifest path; filesystem roots and the repository root are rejected:
