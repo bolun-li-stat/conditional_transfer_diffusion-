@@ -17,9 +17,9 @@ def test_experiment_modules_are_separate_and_imports_are_module_local():
     assert Path(image_transfer.__file__).resolve().is_relative_to(MODULE_ROOT)
 
 
-def test_continuous_integration_uses_module_working_directories():
+def test_continuous_integration_is_scoped_to_image_experiment():
     workflow = (REPOSITORY_ROOT / ".github" / "workflows" / "experiment-ci.yml").read_text(
         encoding="utf-8"
     )
-    assert "working-directory: gmm_simulation" in workflow
     assert "working-directory: image_experiment" in workflow
+    assert "working-directory: gmm_simulation" not in workflow
