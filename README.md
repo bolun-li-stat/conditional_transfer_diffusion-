@@ -6,13 +6,7 @@ This repository contains two independent experiment modules that study transfer 
 
 [`gmm_simulation/`](gmm_simulation/) contains the synthetic Gaussian-mixture experiments, including the original training, evaluation, plotting, configuration, and notebook entry points.
 
-```bash
-cd gmm_simulation
-python -m pip install -r requirements.txt
-python train.py --experiment smoke
-```
-
-The files moved into this module without source-content changes. Their recorded SHA256 values are checked by the repository workflow.
+The GMM files are relocation-only in PR #14. No GMM scientific source, configuration, notebook, result, or module README is intentionally modified, and the image-experiment CI does not install or run the GMM module. Its implementation and existing results are treated as frozen.
 
 ## Image experiment
 
