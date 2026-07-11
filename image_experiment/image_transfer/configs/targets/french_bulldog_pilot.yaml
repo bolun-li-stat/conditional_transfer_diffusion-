@@ -7,6 +7,7 @@ review_date: null
 targets:
   - name: French bulldog
     synset: n02108915
+    primary_target: true
     supercategory: dog
     selection_rationale: >-
       Fixed single-target engineering pilot with predeclared close, medium, and

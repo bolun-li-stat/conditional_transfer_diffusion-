@@ -3,6 +3,13 @@ study_stage: case_study
 data_root: ${DATA_ROOT}
 output_root: ${RESULTS_ROOT:-image_transfer_results}
 image_size: 64
+analysis_plan_path: analysis_plan.yaml
+environment_lock_path: ../../environment/image-transfer-cuda.yml
+exact_environment_lock_path: ${EXACT_ENVIRONMENT_LOCK_PATH:-}
+environment_runtime_report_path: ${ENVIRONMENT_RUNTIME_REPORT_PATH:-}
+gpu_runtime_probe_path: ${GPU_RUNTIME_PROBE_PATH:-}
+resume_probe_path: ${RESUME_PROBE_PATH:-}
+dataset_identity_path: ${DATASET_IDENTITY_PATH:-}
 targets:
   - name: French bulldog
     synset: n02108915
@@ -28,13 +35,16 @@ data_split:
   training_subset_seed: 0
   target_eval_size: 500
   target_val_size: 100
+  auxiliary_eval_size: 100
+  target_similarity_reference_size: 100
+  auxiliary_similarity_reference_size: 100
   nested_training_subsets: true
   eval_source: train_holdout
   insufficient_data_action: skip
 model: {architecture: adm_unet, profile: pilot_small}
 diffusion: {timesteps: 1000, schedule: cosine, prediction_type: epsilon, reverse_variance: fixed}
 optimizer: {name: adamw, lr: 0.0002, betas: [0.9, 0.999], eps: 1.0e-8, weight_decay: 0.0}
-training: {steps: 100000, batch_size: 64, num_workers: 0, precision: amp, validation_interval: 1000, ema_decay: 0.9999, max_grad_norm: 1.0}
+training: {steps: 100000, batch_size: 64, num_workers: 0, precision: amp, validation_interval: 1000, ema_decay: 0.9999, max_grad_norm: 1.0, minimum_gpu_headroom_bytes: 2147483648}
 sampling: {sampler: ddpm, steps: 1000, batch_size: 64, ddim_eta: 0.0}
 num_generated: 5000
 experiments:

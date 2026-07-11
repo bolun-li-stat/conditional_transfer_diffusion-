@@ -8,6 +8,11 @@ image_size: 64
 target_set_path: targets/french_bulldog_pilot.yaml
 analysis_plan_path: analysis_plan.yaml
 environment_lock_path: ../../environment/image-transfer-cuda.yml
+exact_environment_lock_path: ${EXACT_ENVIRONMENT_LOCK_PATH:-}
+environment_runtime_report_path: ${ENVIRONMENT_RUNTIME_REPORT_PATH:-}
+gpu_runtime_probe_path: ${GPU_RUNTIME_PROBE_PATH:-}
+resume_probe_path: ${RESUME_PROBE_PATH:-}
+dataset_identity_path: ${DATASET_IDENTITY_PATH:-}
 metric_assets_manifest_path: ${METRIC_ASSETS_MANIFEST:-}
 include_legacy_unconditional: false
 
@@ -18,6 +23,8 @@ data_split:
   target_eval_size: 500
   target_val_size: 100
   auxiliary_eval_size: 100
+  target_similarity_reference_size: 100
+  auxiliary_similarity_reference_size: 100
   nested_training_subsets: true
   eval_source: train_holdout
   insufficient_data_action: fail
@@ -43,6 +50,7 @@ training:
   precision: amp
   ema_decay: 0.9999
   max_grad_norm: 1.0
+  minimum_gpu_headroom_bytes: 2147483648
   validation_interval: 50
   checkpoint_interval: 50
 sampling: {sampler: ddim, steps: 20, batch_size: 16, ddim_eta: 0.0, guidance_scale: 1.0}
