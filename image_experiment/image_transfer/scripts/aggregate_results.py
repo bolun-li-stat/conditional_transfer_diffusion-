@@ -118,6 +118,7 @@ BASELINE_PAIR_KEY_COLUMNS = [
 ]
 GROUP_COLUMNS = [
     "experiment",
+    "design_label",
     "target_synset",
     "model_type",
     "aux_set",
@@ -253,28 +254,46 @@ def _normalize_columns(frame: pd.DataFrame) -> pd.DataFrame:
         result["target_synset"] = result["target"]
     if "seed" not in result:
         result["seed"] = 0
-    for name in ("data_split_seed", "model_initialization_seed", "training_seed", "sampling_seed", "evaluation_seed"):
+    result["seed"] = pd.to_numeric(result["seed"], errors="coerce").fillna(0).astype(int)
+    for name in ("model_initialization_seed", "training_seed", "sampling_seed", "evaluation_seed"):
         if name not in result:
             result[name] = result["seed"]
         else:
             result[name] = result[name].where(result[name].notna(), result["seed"])
+
+    # A v2 record identifies data randomness with two explicit seeds.  Its
+    # data_split_seed cell is intentionally blank and must remain a nullable
+    # legacy-only alias in tabular outputs.  Only records that lack the v2 pair
+    # receive the historical fallback to the generic seed.
+    holdout_values = pd.to_numeric(
+        result.get("holdout_seed", pd.Series(pd.NA, index=result.index)),
+        errors="coerce",
+    )
+    subset_values = pd.to_numeric(
+        result.get("training_subset_seed", pd.Series(pd.NA, index=result.index)),
+        errors="coerce",
+    )
+    has_v2_data_seeds = holdout_values.notna() & subset_values.notna()
+    legacy_values = pd.to_numeric(
+        result.get("data_split_seed", pd.Series(pd.NA, index=result.index)),
+        errors="coerce",
+    )
+    legacy_values = legacy_values.where(has_v2_data_seeds | legacy_values.notna(), result["seed"])
+    result["data_split_seed"] = legacy_values.astype("Int64")
     if "holdout_seed" not in result:
         result["holdout_seed"] = result["data_split_seed"]
     else:
-        result["holdout_seed"] = result["holdout_seed"].where(
-            result["holdout_seed"].notna(), result["data_split_seed"]
-        )
+        result["holdout_seed"] = holdout_values.fillna(result["data_split_seed"])
     if "training_subset_seed" not in result:
         result["training_subset_seed"] = result["data_split_seed"]
     else:
-        result["training_subset_seed"] = result["training_subset_seed"].where(
-            result["training_subset_seed"].notna(), result["data_split_seed"]
-        )
+        result["training_subset_seed"] = subset_values.fillna(result["data_split_seed"])
     if "training_protocol" not in result:
         result["training_protocol"] = "natural_compute_matched"
     result["training_protocol"] = result["training_protocol"].replace("", "natural_compute_matched").fillna("natural_compute_matched")
     defaults: dict[str, Any] = {
         "experiment": "",
+        "design_label": "legacy_unspecified",
         "target_synset": "",
         "model_type": "",
         "aux_set": "none",
@@ -307,7 +326,7 @@ def _normalize_columns(frame: pd.DataFrame) -> pd.DataFrame:
         else:
             result[key] = result[key].fillna(value)
     for name in (
-        "n0", "m_per_aux", "K_aux", "seed", "data_split_seed", "holdout_seed",
+        "n0", "m_per_aux", "K_aux", "seed", "holdout_seed",
         "training_subset_seed", "model_initialization_seed", "training_seed",
         "sampling_seed", "evaluation_seed", "sampling_steps",
     ):
@@ -527,6 +546,7 @@ def compute_paired_gaps(
                         gap = improvement_positive(float(model_value), float(baseline_value), metric)
                 row = {column: pair_identity.get(column) for column in PAIR_KEY_COLUMNS}
                 for column in (
+                    "design_label",
                     "model_type",
                     "aux_set",
                     "aux_composition",
@@ -689,6 +709,7 @@ def _condition_columns(frame: pd.DataFrame) -> list[str]:
         column
         for column in (
             "experiment",
+            "design_label",
             "model_type",
             "aux_set",
             "n0",
@@ -696,7 +717,6 @@ def _condition_columns(frame: pd.DataFrame) -> list[str]:
             "K_aux",
             "auxiliary_ratio",
             "total_auxiliary_budget",
-            "average_auxiliary_similarity",
             "training_protocol",
             "architecture",
             "architecture_profile",
@@ -716,13 +736,50 @@ def _condition_columns(frame: pd.DataFrame) -> list[str]:
     ]
 
 
+def _continuous_covariates(frame: pd.DataFrame) -> dict[str, float]:
+    """Summarize explanatory covariates without turning them into exact keys.
+
+    In particular, measured auxiliary similarity varies across frozen auxiliary
+    draws.  Grouping on the floating-point value would make each draw look like
+    a separate statistical condition and would bypass the intended nesting.
+    """
+
+    values = pd.to_numeric(
+        frame.get("average_auxiliary_similarity", pd.Series(dtype=float)), errors="coerce"
+    ).dropna()
+    if values.empty:
+        return {"average_auxiliary_similarity": np.nan}
+    return {"average_auxiliary_similarity": float(values.mean())}
+
+
+def _uniform_or_nan(values: pd.Series) -> float:
+    numeric = pd.to_numeric(values, errors="coerce").dropna()
+    return float(numeric.iloc[0]) if not numeric.empty and numeric.nunique() == 1 else np.nan
+
+
+def _repeats_per_optimization(frame: pd.DataFrame, repeat_columns: list[str]) -> float:
+    optimization_ids = [column for column in OPTIMIZATION_ID_COLUMNS if column in frame]
+    if frame.empty:
+        return 0.0
+    if not optimization_ids:
+        return float(_unique_rows(frame, repeat_columns))
+    counts = pd.Series(
+        [
+            _unique_rows(part, repeat_columns)
+            for _, part in frame.groupby(optimization_ids, dropna=False)
+        ],
+        dtype=float,
+    )
+    return _uniform_or_nan(counts)
+
+
 def _unique_rows(frame: pd.DataFrame, columns: list[str]) -> int:
     present = [column for column in columns if column in frame]
     return int(len(frame[present].drop_duplicates())) if present and not frame.empty else int(bool(len(frame)))
 
 
 def summarize_by_training_subset(pairs: pd.DataFrame) -> pd.DataFrame:
-    """Average draws within optimization repeats, then repeats within subsets."""
+    """Average technical repeats, then optimization repeats, within each subset."""
 
     if pairs.empty:
         return pd.DataFrame()
@@ -738,26 +795,53 @@ def summarize_by_training_subset(pairs: pd.DataFrame) -> pd.DataFrame:
         if complete.empty:
             optimization_values: list[float] = []
         elif optimization_ids:
-            # Auxiliary draws and repeated evaluation streams are nested inside
-            # one trained-model repeat; they cannot increase the target-data n.
-            optimization_values = (
-                complete.groupby(optimization_ids, dropna=False)["improvement_positive"].mean().tolist()
-            )
+            # Auxiliary draws, sampling streams, and evaluation streams are
+            # nested inside one trained-model repeat.  Average them before the
+            # optimization-repeat layer so none can increase target-data n.
+            optimization_values = []
+            for _, technical_repeats in complete.groupby(optimization_ids, dropna=False):
+                values = pd.to_numeric(
+                    technical_repeats["improvement_positive"], errors="coerce"
+                ).dropna()
+                if not values.empty:
+                    optimization_values.append(float(values.mean()))
         else:
             optimization_values = [float(complete["improvement_positive"].mean())]
         row.update(t95_confidence_interval(optimization_values))
         row.update(_sample_count_fields(complete))
+        row.update(_continuous_covariates(complete))
+        optimization_count = _unique_rows(group, OPTIMIZATION_ID_COLUMNS)
+        auxiliary_draw_count = _unique_rows(group, ["aux_draw_id", "aux_composition"])
+        sampling_repeat_count = _unique_rows(group, ["sampling_seed"])
+        evaluation_repeat_count = _unique_rows(group, ["evaluation_seed"])
+        completed_pairs = int(len(complete))
+        failed_or_missing_pairs = int(len(group) - len(complete))
         row.update(
             {
                 "summary_type": "training_subset",
                 "improvement_positive": float(np.mean(optimization_values)) if optimization_values else np.nan,
                 "number_targets": 1,
                 "number_independent_training_subsets": 1,
-                "number_optimization_repeats": _unique_rows(group, OPTIMIZATION_ID_COLUMNS),
+                "number_optimization_repeats": optimization_count,
+                "number_optimization_repeats_per_subset": optimization_count,
                 "number_completed_optimization_repeats": len(optimization_values),
-                "number_auxiliary_draws": _unique_rows(group, ["aux_draw_id", "aux_composition"]),
-                "number_completed_draw_pairs": int(len(complete)),
-                "number_missing_failed_pairs": int(len(group) - len(complete)),
+                "number_auxiliary_draws": auxiliary_draw_count,
+                "number_auxiliary_draws_per_optimization_repeat": _repeats_per_optimization(
+                    group, ["aux_draw_id", "aux_composition"]
+                ),
+                "number_sampling_repeats": sampling_repeat_count,
+                "number_sampling_repeats_per_optimization_repeat": _repeats_per_optimization(
+                    group, ["sampling_seed"]
+                ),
+                "number_evaluation_repeats": evaluation_repeat_count,
+                "number_evaluation_repeats_per_optimization_repeat": _repeats_per_optimization(
+                    group, ["evaluation_seed"]
+                ),
+                "number_completed_pairs": completed_pairs,
+                "number_failed_or_missing_pairs": failed_or_missing_pairs,
+                # Compatibility aliases retained for existing downstream CSV readers.
+                "number_completed_draw_pairs": completed_pairs,
+                "number_missing_failed_pairs": failed_or_missing_pairs,
                 "number_unique_baseline_runs": int(complete.get("baseline_run_id", pd.Series(dtype=str)).nunique()),
             }
         )
@@ -780,6 +864,9 @@ def summarize_by_target(subset_summaries: pd.DataFrame) -> pd.DataFrame:
         stats = t95_confidence_interval(values.tolist())
         row.update(stats)
         row.update(_sample_count_fields(group))
+        row.update(_continuous_covariates(group))
+        completed_pairs = int(group["number_completed_pairs"].sum())
+        failed_or_missing_pairs = int(group["number_failed_or_missing_pairs"].sum())
         row.update(
             {
                 "summary_type": "target_conditional",
@@ -792,7 +879,23 @@ def summarize_by_target(subset_summaries: pd.DataFrame) -> pd.DataFrame:
                 "number_holdout_splits": int(group.get("split_manifest_hash", pd.Series(dtype=str)).nunique()),
                 "number_independent_training_subsets": int(values.notna().sum()),
                 "number_optimization_repeats": int(group["number_optimization_repeats"].sum()),
+                "number_optimization_repeats_per_subset": _uniform_or_nan(
+                    group["number_optimization_repeats_per_subset"]
+                ),
                 "number_auxiliary_draws": int(group["number_auxiliary_draws"].sum()),
+                "number_auxiliary_draws_per_optimization_repeat": _uniform_or_nan(
+                    group["number_auxiliary_draws_per_optimization_repeat"]
+                ),
+                "number_sampling_repeats": int(group["number_sampling_repeats"].sum()),
+                "number_sampling_repeats_per_optimization_repeat": _uniform_or_nan(
+                    group["number_sampling_repeats_per_optimization_repeat"]
+                ),
+                "number_evaluation_repeats": int(group["number_evaluation_repeats"].sum()),
+                "number_evaluation_repeats_per_optimization_repeat": _uniform_or_nan(
+                    group["number_evaluation_repeats_per_optimization_repeat"]
+                ),
+                "number_completed_pairs": completed_pairs,
+                "number_failed_or_missing_pairs": failed_or_missing_pairs,
                 "number_completed_draw_pairs": int(group["number_completed_draw_pairs"].sum()),
                 "number_missing_failed_pairs": int(group["number_missing_failed_pairs"].sum()),
             }
@@ -823,6 +926,9 @@ def hierarchical_target_bootstrap(
         }
         target_groups = {target: part for target, part in target_groups.items() if not part.empty}
         target_means = [float(part["improvement_positive"].mean()) for part in target_groups.values()]
+        completed_pairs = int(group["number_completed_pairs"].sum())
+        failed_or_missing_pairs = int(group["number_failed_or_missing_pairs"].sum())
+        row.update(_continuous_covariates(group))
         row.update(
             {
                 "summary_type": "hierarchical_across_target",
@@ -833,7 +939,23 @@ def hierarchical_target_bootstrap(
                     pd.to_numeric(group["improvement_positive"], errors="coerce").notna().sum()
                 ),
                 "number_optimization_repeats": int(group["number_optimization_repeats"].sum()),
+                "number_optimization_repeats_per_subset": _uniform_or_nan(
+                    group["number_optimization_repeats_per_subset"]
+                ),
                 "number_auxiliary_draws": int(group["number_auxiliary_draws"].sum()),
+                "number_auxiliary_draws_per_optimization_repeat": _uniform_or_nan(
+                    group["number_auxiliary_draws_per_optimization_repeat"]
+                ),
+                "number_sampling_repeats": int(group["number_sampling_repeats"].sum()),
+                "number_sampling_repeats_per_optimization_repeat": _uniform_or_nan(
+                    group["number_sampling_repeats_per_optimization_repeat"]
+                ),
+                "number_evaluation_repeats": int(group["number_evaluation_repeats"].sum()),
+                "number_evaluation_repeats_per_optimization_repeat": _uniform_or_nan(
+                    group["number_evaluation_repeats_per_optimization_repeat"]
+                ),
+                "number_completed_pairs": completed_pairs,
+                "number_failed_or_missing_pairs": failed_or_missing_pairs,
                 "number_completed_draw_pairs": int(group["number_completed_draw_pairs"].sum()),
                 "number_missing_failed_pairs": int(group["number_missing_failed_pairs"].sum()),
             }
@@ -921,16 +1043,8 @@ def similarity_correlations(pairs: pd.DataFrame, bootstrap_samples: int = 1000) 
     # composition itself and often leave constant-similarity/undefined groups.
     group_columns = [
         column
-        for column in (
-            "experiment",
-            "n0",
-            "m_per_aux",
-            "K_aux",
-            "training_protocol",
-            "baseline_kind",
-            "metric",
-        )
-        if column in valid
+        for column in _condition_columns(valid)
+        if column not in {"model_type", "aux_set"}
     ]
     rows = []
     rng = np.random.default_rng(0)

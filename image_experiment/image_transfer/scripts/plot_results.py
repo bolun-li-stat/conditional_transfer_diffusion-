@@ -116,9 +116,9 @@ def _plot_paired_axis(
         "average_auxiliary_similarity": ("n0", "m_per_aux", "K_aux"),
     }.get(x_column, ())
     identity_candidates = (
-        ("training_protocol", "baseline_kind", *conditioning)
+        ("design_label", "training_protocol", "baseline_kind", *conditioning)
         if x_column == "average_auxiliary_similarity"
-        else ("model_type", "aux_set", "training_protocol", "baseline_kind", *conditioning)
+        else ("design_label", "model_type", "aux_set", "training_protocol", "baseline_kind", *conditioning)
     )
     identity_columns = [column for column in identity_candidates if column in frame]
     summary = _nested_plot_summary(frame)
@@ -219,6 +219,7 @@ def _plot_noise_bins(metrics: pd.DataFrame, figdir: Path) -> Path | None:
         column
         for column in (
             "experiment",
+            "design_label",
             "target_synset" if summary.get("summary_type", pd.Series(dtype=str)).eq("target_conditional").any() else None,
             "model_type",
             "training_protocol",

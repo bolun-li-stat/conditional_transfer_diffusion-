@@ -13,6 +13,7 @@ from torch import nn
 from torch.utils.data import ConcatDataset, TensorDataset
 
 from image_transfer.scripts.aggregate_results import (
+    _normalize_columns,
     aggregate_results,
     compute_paired_gaps,
     improvement_positive,
@@ -64,6 +65,34 @@ def tiny_training(monkeypatch):
 def _dataset(labels):
     x = torch.arange(len(labels) * 4, dtype=torch.float32).reshape(len(labels), 1, 2, 2) / 20
     return TensorDataset(x, torch.tensor(labels, dtype=torch.long))
+
+
+def test_seed_normalization_preserves_blank_v2_alias_and_legacy_fallback():
+    frame = pd.DataFrame(
+        [
+            {
+                "run_id": "v2",
+                "seed": 9,
+                "data_split_seed": "",
+                "holdout_seed": 100,
+                "training_subset_seed": 4,
+            },
+            {
+                "run_id": "legacy",
+                "seed": 7,
+            },
+        ]
+    )
+
+    normalized = _normalize_columns(frame).set_index("run_id")
+
+    assert pd.isna(normalized.loc["v2", "data_split_seed"])
+    assert normalized.loc["v2", "holdout_seed"] == 100
+    assert normalized.loc["v2", "training_subset_seed"] == 4
+    assert normalized.loc["legacy", "data_split_seed"] == 7
+    assert normalized.loc["legacy", "holdout_seed"] == 7
+    assert normalized.loc["legacy", "training_subset_seed"] == 7
+    assert str(normalized["data_split_seed"].dtype) == "Int64"
 
 
 def _train_kwargs(tmp_path: Path, checkpoint_name: str, steps: int) -> dict:
@@ -304,6 +333,15 @@ def _result(run_id: str, model_type: str, seed: int, *, fid: float, top1: float)
             "git_sha": "deadbeef",
             "selected_checkpoint_path": "checkpoint.pt",
             "target_eval_indices_hash": "eval",
+            "dataset_identity_hash": "1" * 64,
+            "dataset_content_hash": "2" * 64,
+            "target_similarity_reference_hash": "3" * 64,
+            "auxiliary_similarity_reference_hashes": {},
+            "selected_auxiliary_similarity_reference_hashes": {},
+            "similarity_metric_reference_hash": "4" * 64,
+            "environment_runtime_hash": "5" * 64,
+            "environment_report_hash": "6" * 64,
+            "environment_report": {},
             "aux_synsets": json.dumps(["n02108915"] if model_type == "conditional_close" else []),
         },
         "training": {
@@ -585,6 +623,7 @@ def test_hierarchical_summaries_do_not_count_draws_as_subset_replicates():
                             "training_seed": optimization_seed,
                             "aux_draw_id": draw,
                             "aux_composition": json.dumps([f"aux-{draw}"]),
+                            "average_auxiliary_similarity": 0.1 * draw,
                             "baseline_run_id": f"baseline-{target}-{subset_seed}-{optimization_seed}",
                             "improvement_positive": float(target_index + subset_seed + optimization_seed + draw),
                         }
@@ -594,6 +633,7 @@ def test_hierarchical_summaries_do_not_count_draws_as_subset_replicates():
     assert len(subsets) == 4
     assert set(subsets["number_optimization_repeats"]) == {2}
     assert set(subsets["number_auxiliary_draws"]) == {3}
+    assert all(value == pytest.approx(0.1) for value in subsets["average_auxiliary_similarity"])
     targets = summarize_by_target(subsets)
     assert len(targets) == 2
     assert set(targets["number_independent_training_subsets"]) == {2}
@@ -609,6 +649,63 @@ def test_hierarchical_summaries_do_not_count_draws_as_subset_replicates():
     )
     assert one_target.iloc[0]["hierarchical_status"] == "unavailable_single_target"
     assert np.isnan(one_target.iloc[0]["ci95_lower"])
+
+
+def test_nested_summary_averages_sampling_and_evaluation_before_optimization():
+    rows = []
+    for subset_seed in (0, 1):
+        for optimization_seed in (0, 1):
+            for draw in (0, 1, 2):
+                for sampling_seed in (1000, 1001):
+                    for evaluation_seed in (2000, 2001):
+                        rows.append(
+                            {
+                                "experiment": "A",
+                                "design_label": "equal_per_class",
+                                "target_synset": "target-a",
+                                "model_type": "conditional_close",
+                                "aux_set": "close",
+                                "n0": 50,
+                                "m_per_aux": 50,
+                                "K_aux": 3,
+                                "training_protocol": "natural_compute_matched",
+                                "baseline_kind": "primary",
+                                "baseline_model_type": "conditional_target_only_n0",
+                                "metric": "kid_target_mean",
+                                "pair_status": "completed",
+                                "split_manifest_hash": "split-a",
+                                "subset_manifest_hash": f"subset-{subset_seed}",
+                                "holdout_seed": 100,
+                                "training_subset_seed": subset_seed,
+                                "model_initialization_seed": optimization_seed,
+                                "training_seed": optimization_seed,
+                                "sampling_seed": sampling_seed,
+                                "evaluation_seed": evaluation_seed,
+                                "aux_draw_id": draw,
+                                "aux_composition": json.dumps([f"aux-{draw}"]),
+                                "average_auxiliary_similarity": float(draw),
+                                "baseline_run_id": f"baseline-{subset_seed}-{optimization_seed}",
+                                "improvement_positive": float(subset_seed + optimization_seed + draw),
+                            }
+                        )
+
+    subsets = summarize_by_training_subset(pd.DataFrame(rows))
+    assert len(subsets) == 2
+    assert set(subsets["number_independent_training_subsets"]) == {1}
+    assert set(subsets["number_optimization_repeats_per_subset"]) == {2}
+    assert set(subsets["number_auxiliary_draws"]) == {3}
+    assert set(subsets["number_sampling_repeats"]) == {2}
+    assert set(subsets["number_evaluation_repeats"]) == {2}
+    assert set(subsets["number_completed_pairs"]) == {24}
+    # Twelve technical observations collapse to one value per optimization
+    # repeat; the two optimization values then collapse to one subset value.
+    assert sorted(subsets["improvement_positive"].tolist()) == pytest.approx([1.5, 2.5])
+
+    target = summarize_by_target(subsets).iloc[0]
+    assert target["number_independent_training_subsets"] == 2
+    assert target["number_optimization_repeats"] == 4
+    assert target["number_optimization_repeats_per_subset"] == 2
+    assert target["number_completed_pairs"] == 48
 
 
 @pytest.mark.parametrize("field", ["subset_manifest_hash", "model_config_hash", "target_set_hash"])
