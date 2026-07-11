@@ -532,6 +532,7 @@ def train_image_model(
     cumulative_train_seconds = 0.0
     cumulative_optimizer_seconds = 0.0
     saved_rolling_loss_state: dict[str, Any] = {}
+    saved_terminal_training_state: dict[str, Any] | None = None
     current_best = float("inf") if best_validation_metric is None else float(best_validation_metric)
     if resume_path is not None:
         checkpoint = load_training_checkpoint(
@@ -556,6 +557,9 @@ def train_image_model(
         cumulative_train_seconds = float(saved_protocol_metadata.get("wallclock_train_seconds", 0.0))
         cumulative_optimizer_seconds = float(saved_protocol_metadata.get("optimizer_compute_seconds", 0.0))
         saved_rolling_loss_state = dict(saved_protocol_metadata.get("rolling_loss_state") or {})
+        terminal_value = saved_protocol_metadata.get("terminal_training_state")
+        if isinstance(terminal_value, Mapping):
+            saved_terminal_training_state = dict(terminal_value)
         saved_best = checkpoint.get("best_validation_metric")
         if saved_best is not None:
             current_best = float(saved_best)
@@ -642,10 +646,63 @@ def train_image_model(
     start_time = time.time()
     resolved_git_sha = git_sha or get_git_sha()
 
+    def terminal_number(value: float) -> float | None:
+        return float(value) if math.isfinite(float(value)) else None
+
+    required_terminal_fields = {
+        "final_objective_train_loss",
+        "final_pooled_train_loss",
+        "final_target_batch_train_loss",
+        "final_auxiliary_batch_train_loss",
+        "final_pooled_batch_size",
+        "final_target_batch_size",
+        "final_auxiliary_batch_size",
+        "final_gradient_norm",
+        "gradient_clipping_count",
+        "denoising_metrics",
+        "last_validation_step",
+    }
+    if resume_path is not None and start_step == steps:
+        if saved_terminal_training_state is None or not required_terminal_fields.issubset(saved_terminal_training_state):
+            raise RuntimeError(
+                "Checkpoint is already at the requested terminal step but lacks terminal training state; "
+                "refusing to emit an incomplete result"
+            )
+        terminal = saved_terminal_training_state
+        final_loss = float("nan") if terminal["final_objective_train_loss"] is None else float(terminal["final_objective_train_loss"])
+        final_pooled_loss = float("nan") if terminal["final_pooled_train_loss"] is None else float(terminal["final_pooled_train_loss"])
+        final_target_loss = float("nan") if terminal["final_target_batch_train_loss"] is None else float(terminal["final_target_batch_train_loss"])
+        final_auxiliary_loss = float("nan") if terminal["final_auxiliary_batch_train_loss"] is None else float(terminal["final_auxiliary_batch_train_loss"])
+        final_pooled_batch_size = int(terminal["final_pooled_batch_size"])
+        final_target_batch_size = int(terminal["final_target_batch_size"])
+        final_auxiliary_batch_size = int(terminal["final_auxiliary_batch_size"])
+        final_grad_norm = float("nan") if terminal["final_gradient_norm"] is None else float(terminal["final_gradient_norm"])
+        gradient_clipping_count = int(terminal["gradient_clipping_count"])
+        denoise = {
+            key: (float("nan") if value is None else float(value))
+            for key, value in dict(terminal["denoising_metrics"]).items()
+        }
+        last_validation_step = int(terminal["last_validation_step"])
+    elif saved_terminal_training_state is not None:
+        gradient_clipping_count = int(saved_terminal_training_state.get("gradient_clipping_count", 0))
+
     def protocol_metadata(current_step: int) -> dict[str, Any]:
         total = counters["target_examples_seen"] + counters["auxiliary_examples_seen"]
         elapsed = float(cumulative_train_seconds + (time.time() - start_time))
         optimizer_seconds = float(cumulative_optimizer_seconds)
+        terminal_state = {
+            "final_objective_train_loss": terminal_number(final_loss),
+            "final_pooled_train_loss": terminal_number(final_pooled_loss),
+            "final_target_batch_train_loss": terminal_number(final_target_loss),
+            "final_auxiliary_batch_train_loss": terminal_number(final_auxiliary_loss),
+            "final_pooled_batch_size": int(final_pooled_batch_size),
+            "final_target_batch_size": int(final_target_batch_size),
+            "final_auxiliary_batch_size": int(final_auxiliary_batch_size),
+            "final_gradient_norm": terminal_number(final_grad_norm),
+            "gradient_clipping_count": int(gradient_clipping_count),
+            "denoising_metrics": {key: terminal_number(float(value)) for key, value in denoise.items()},
+            "last_validation_step": int(last_validation_step),
+        }
         return {
             **counters,
             "optimizer_steps": int(current_step),
@@ -668,6 +725,7 @@ def train_image_model(
             "resume_bitwise_identity_guaranteed": bool(int(num_workers) == 0 and device.type == "cpu"),
             "checkpoint_interval": int(resolved_checkpoint_interval),
             "validation_interval": int(validation_interval),
+            "terminal_training_state": terminal_state,
         }
 
     def save_training_state(

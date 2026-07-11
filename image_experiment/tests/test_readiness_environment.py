@@ -13,8 +13,10 @@ import yaml
 
 from image_transfer.config.config_schema import load_resolved_config, resolve_config
 from image_transfer.evaluation.corruption_bank import create_corruption_bank, save_corruption_bank
+from image_transfer.environment_lock import build_exact_environment_lock
 from image_transfer.readiness import enforce_readiness_gate
 from image_transfer.scripts.inspect_environment import inspect_environment
+from image_transfer.utils.io import canonical_json_hash
 from image_transfer.scripts.make_job_grid import JOB_FIELDS, compute_resolved_run_spec_hash
 from image_transfer.scripts import prepare_metric_assets as asset_tools
 from image_transfer.scripts.prepare_metric_assets import (
@@ -326,6 +328,10 @@ def test_environment_pin_matching_and_gpu_config_identity(tmp_path):
     for name in ("imagenet64_gpu_smoke.yaml", "imagenet64_release_pilot.yaml", "imagenet64_main_template.yaml"):
         config = yaml.safe_load((root / "image_transfer" / "configs" / name).read_text(encoding="utf-8"))
         assert config["environment_lock_path"].endswith("image-transfer-cuda.yml")
+        assert config["exact_environment_lock_path"] == "${EXACT_ENVIRONMENT_LOCK_PATH:-}"
+        assert config["environment_runtime_report_path"] == "${ENVIRONMENT_RUNTIME_REPORT_PATH:-}"
+        assert config["gpu_runtime_probe_path"] == "${GPU_RUNTIME_PROBE_PATH:-}"
+        assert config["resume_probe_path"] == "${RESUME_PROBE_PATH:-}"
         assert config["metric_assets_manifest_path"] == "${METRIC_ASSETS_MANIFEST:-}"
     assert cuda_definition.is_file()
     cuda_report = inspect_environment(cuda_definition)
@@ -369,7 +375,7 @@ def test_passed_gate_links_exact_pilot_and_runtime_identity(tmp_path):
     git_sha = "b" * 40
     status_path = tmp_path / "status.json"
     status = {
-        "schema_version": "2.0",
+        "schema_version": "3.0",
         "status": "passed",
         "git_sha": git_sha,
         "model_config_hash": pilot.model_hash,
@@ -380,10 +386,21 @@ def test_passed_gate_links_exact_pilot_and_runtime_identity(tmp_path):
         "expected_jobs": 1,
         "validated_jobs": 1,
         "resume_state_validated_jobs": 1,
+        "checkpoint_artifacts_validated_jobs": 1,
+        "sample_artifacts_validated_jobs": 1,
+        "metric_artifacts_validated_jobs": 1,
+        "nearest_neighbor_artifacts_validated_jobs": 1,
+        "figure_artifacts_validated_jobs": 1,
+        "provenance_artifacts_validated_jobs": 1,
         "validated_pairs": 1,
         "validated_result_hashes": {"run": "1" * 64},
         "expected_job_grid_hash": "2" * 64,
         "jobs_csv_hash": "3" * 64,
+        "environment_runtime_hash": "4" * 64,
+        "environment_report_hash": "5" * 64,
+        "exact_environment_lock_hash": "8" * 64,
+        "gpu_load_probe_hash": "6" * 64,
+        "resume_probe_hash": "7" * 64,
         "failures": [],
     }
     status_path.write_text(json.dumps(status), encoding="utf-8")
@@ -457,9 +474,19 @@ def test_readiness_audit_fields_change_run_identity():
     assert compute_resolved_run_spec_hash(base) != compute_resolved_run_spec_hash(changed)
 
 
-def test_release_validator_accepts_exact_complete_fixture(tmp_path):
+def test_release_validator_accepts_exact_complete_fixture(tmp_path, monkeypatch):
     lock = tmp_path / "lock.txt"
     lock.write_text("example==1.0\n", encoding="utf-8")
+    exact_lock = tmp_path / "exact-lock.json"
+    exact_lock.write_text(
+        json.dumps(
+            build_exact_environment_lock(
+                source_spec_path=lock,
+                source_spec_hash=hashlib.sha256(lock.read_bytes()).hexdigest(),
+            )
+        ),
+        encoding="utf-8",
+    )
     analysis_plan = _write_analysis_plan(tmp_path / "analysis.yaml")
     results_root = tmp_path / "results"
     analysis_path = tmp_path / "analysis.yaml"
@@ -480,6 +507,8 @@ def test_release_validator_accepts_exact_complete_fixture(tmp_path):
             "auxiliary_sets": {"close": ["a"], "medium": ["m"], "far": ["b"]},
         }],
         "environment_lock_path": str(lock),
+        "exact_environment_lock_path": str(exact_lock),
+        "dataset_identity_path": str(tmp_path / "identity.json"),
         "analysis_plan_path": str(analysis_path),
         "analysis_plan_path": str(analysis_plan),
         "data_split": {
@@ -517,6 +546,30 @@ def test_release_validator_accepts_exact_complete_fixture(tmp_path):
     config_path = tmp_path / "pilot.yaml"
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
     resolved = load_resolved_config(config_path)
+    dataset_identity = {
+        "dataset_identity_hash": "8" * 64,
+        "dataset_content_hash": "9" * 64,
+    }
+    monkeypatch.setattr(
+        "image_transfer.scripts.validate_release_pilot.verify_dataset_identity_file",
+        lambda *args, **kwargs: dataset_identity,
+    )
+    environment_report = inspect_environment(exact_lock, source_spec_path=lock)
+    environment_report["lock_matches_runtime"] = True
+    environment_report["lock_mismatches"] = []
+    environment_report["environment_report_hash"] = canonical_json_hash(
+        {key: value for key, value in environment_report.items() if key != "environment_report_hash"}
+    )
+    monkeypatch.setattr(
+        "image_transfer.scripts.validate_release_pilot._validate_external_runtime_evidence",
+        lambda *args, **kwargs: {
+            "environment_runtime_hash": environment_report["environment_runtime_hash"],
+            "environment_report_hash": environment_report["environment_report_hash"],
+            "exact_environment_lock_hash": environment_report["exact_environment_lock_hash"],
+            "gpu_load_probe_hash": "a" * 64,
+            "resume_probe_hash": "b" * 64,
+        },
+    )
     rows = rebuild_expected_jobs(config_path, resolved)
     assert len(rows) == 3
     jobs_path = tmp_path / "jobs.csv"
@@ -631,12 +684,12 @@ def test_release_validator_accepts_exact_complete_fixture(tmp_path):
                 "resolved_run_spec_hash", "config_hash", "architecture", "architecture_profile",
             )},
             "git_sha": git_sha,
-            "environment_runtime_hash": "runtime-hash",
-            "environment_report": {
-                "environment_lock_hash": row["environment_lock_hash"],
-                "environment_runtime_hash": "runtime-hash",
-                "lock_matches_runtime": True,
-            },
+            **dataset_identity,
+            "target_similarity_reference_hash": "6" * 64,
+            "auxiliary_similarity_reference_hashes": {"a": "a" * 64, "m": "b" * 64, "b": "c" * 64},
+            "environment_runtime_hash": environment_report["environment_runtime_hash"],
+            "environment_report_hash": environment_report["environment_report_hash"],
+            "environment_report": environment_report,
             "wallclock_total_seconds": 1.0,
             "peak_gpu_memory_bytes": 1,
             "selected_checkpoint_path": str(paths["best_checkpoint_path"]),
@@ -650,6 +703,20 @@ def test_release_validator_accepts_exact_complete_fixture(tmp_path):
             "test_corruption_bank_path": str(banks["test"][1]),
             "train_corruption_bank_path": str(banks["train"][1]),
         }
+        selected_labels = json.loads(str(row.get("aux_composition", "[]")))
+        metadata["selected_auxiliary_similarity_reference_hashes"] = {
+            label: metadata["auxiliary_similarity_reference_hashes"][label]
+            for label in selected_labels
+        }
+        metadata["similarity_metric_reference_hash"] = canonical_json_hash({
+            "split": "dedicated_similarity_reference",
+            "target": metadata["target_similarity_reference_hash"],
+            "auxiliary": metadata["selected_auxiliary_similarity_reference_hashes"],
+        })
+        checkpoint["provenance"]["environment_runtime_hash"] = metadata["environment_runtime_hash"]
+        checkpoint["provenance"]["environment_report_hash"] = metadata["environment_report_hash"]
+        torch.save(checkpoint, paths["last_checkpoint_path"])
+        torch.save(checkpoint, paths["best_checkpoint_path"])
         training = {
             "optimizer_steps": 2,
             "target_examples_seen": target_seen,
@@ -659,6 +726,11 @@ def test_release_validator_accepts_exact_complete_fixture(tmp_path):
             "final_pooled_train_loss": 1.0,
             "final_target_batch_train_loss": 1.0,
             "final_auxiliary_batch_train_loss": None if baseline else 1.0,
+            "rolling_pooled_train_loss": 1.0,
+            "rolling_target_train_loss": 1.0,
+            "rolling_auxiliary_train_loss": None if baseline else 1.0,
+            "actual_target_batch_size": 2 if not baseline else 2,
+            "actual_auxiliary_batch_size": 0 if baseline else 1,
             "validation_epsilon_mse_target": 1.0,
             "wallclock_train_seconds": 1.0,
             "images_processed_per_second": 1.0,

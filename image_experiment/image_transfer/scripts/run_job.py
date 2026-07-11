@@ -8,10 +8,8 @@ from types import SimpleNamespace
 from image_transfer.scripts.train_one import run
 from image_transfer.utils.io import (
     get_git_sha,
-    load_valid_result,
     load_yaml,
     resolve_env_path,
-    run_result_path,
     write_failure_result,
 )
 
@@ -36,18 +34,6 @@ def main() -> None:
     cfg = load_yaml(job["config_path"])
     results_root = resolve_env_path(cfg.get("output_root"), "image_transfer_results")
     run_id = job.get("run_id") or f"job_{index}"
-
-    # A checkpoint is only an intermediate artifact.  Workers skip exclusively
-    # when the canonical per-run result exists and passes schema validation.
-    result_path = run_result_path(results_root, run_id)
-    if result_path.exists() and not args.force:
-        try:
-            load_valid_result(result_path, expected_run_id=run_id)
-        except (OSError, ValueError):
-            pass
-        else:
-            print(f"skipped completed run: {result_path}")
-            return
 
     namespace = SimpleNamespace(
         config=job["config_path"],

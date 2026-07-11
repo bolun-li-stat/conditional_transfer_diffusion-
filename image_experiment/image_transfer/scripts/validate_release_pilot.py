@@ -17,10 +17,13 @@ import torch
 import yaml
 
 from image_transfer.config import ResolvedConfig, load_resolved_config
+from image_transfer.data.dataset_identity import verify_dataset_identity_file
 from image_transfer.data.manifests import canonical_sha256
 from image_transfer.evaluation.corruption_bank import load_corruption_bank
+from image_transfer.scripts.inspect_environment import validate_environment_report
 from image_transfer.scripts.make_job_grid import JOB_FIELDS, RUN_SPEC_FIELDS, rows_for_experiment
-from image_transfer.utils.io import atomic_write_json, load_valid_result, resolve_env_path
+from image_transfer.training.runtime_probe import PROTOCOLS
+from image_transfer.utils.io import atomic_write_json, canonical_json_hash, load_json, load_valid_result, resolve_env_path
 
 
 _RESULT_JOB_EXCLUSIONS = {"config_path", "output_dir", "manifest_key"}
@@ -145,6 +148,7 @@ def _validate_checkpoint(
     metadata: Mapping[str, Any],
     git_sha: str,
     failures: list[str],
+    require_final_step: bool,
 ) -> bool:
     try:
         checkpoint = _load_torch(path)
@@ -152,12 +156,17 @@ def _validate_checkpoint(
         failures.append(f"invalid_checkpoint:{run_id}:{type(exception).__name__}")
         return False
     checks = {
-        "step": int(expected["training_steps"]),
         "config_hash": expected["resolved_config_hash"],
         "manifest_hash": metadata.get("manifest_hash"),
         "git_sha": git_sha,
         "training_protocol": expected["training_protocol"],
     }
+    checkpoint_step = int(checkpoint.get("step", -1))
+    if require_final_step:
+        if checkpoint_step != int(expected["training_steps"]):
+            failures.append(f"checkpoint_provenance:{run_id}:step")
+    elif not 0 < checkpoint_step <= int(expected["training_steps"]):
+        failures.append(f"checkpoint_provenance:{run_id}:step")
     for field, value in checks.items():
         if checkpoint.get(field) != value:
             failures.append(f"checkpoint_provenance:{run_id}:{field}")
@@ -179,7 +188,7 @@ def _validate_checkpoint(
         if name not in rng:
             failures.append(f"checkpoint_resume_state:{run_id}:rng:{name}")
     data_state = checkpoint.get("data_state") or {}
-    if int(data_state.get("global_step", -1)) != int(expected["training_steps"]):
+    if int(data_state.get("global_step", -1)) != checkpoint_step:
         failures.append(f"checkpoint_resume_state:{run_id}:data_position")
     if "sampler_seed" not in data_state or "num_workers" not in data_state:
         failures.append(f"checkpoint_resume_state:{run_id}:sampler")
@@ -209,6 +218,9 @@ def _validate_checkpoint(
         )
         if provenance.get(field) != expected_value:
             failures.append(f"checkpoint_provenance:{run_id}:{field}")
+    for field in ("environment_runtime_hash", "environment_report_hash"):
+        if provenance.get(field) != metadata.get(field):
+            failures.append(f"checkpoint_provenance:{run_id}:{field}")
     for field in ("raw_config", "resolved_config", "split_manifest", "subset_manifest", "environment_report"):
         if not isinstance(provenance.get(field), Mapping):
             failures.append(f"checkpoint_provenance:{run_id}:{field}")
@@ -223,7 +235,7 @@ def _validate_artifacts(
     record: Mapping[str, Any],
     config: Mapping[str, Any],
     failures: list[str],
-) -> bool:
+) -> dict[str, bool]:
     run_id = str(expected["run_id"])
     metadata = record["metadata"]
     output_dir = Path(str(expected["output_dir"]))
@@ -267,6 +279,7 @@ def _validate_artifacts(
             metadata=metadata,
             git_sha=str(metadata.get("git_sha", "")),
             failures=failures,
+            require_final_step=True,
         )
     best_path = paths.get("best_checkpoint_path")
     if best_path is not None:
@@ -277,6 +290,7 @@ def _validate_artifacts(
             metadata=metadata,
             git_sha=str(metadata.get("git_sha", "")),
             failures=failures,
+            require_final_step=False,
         )
 
     run_config_path = paths.get("run_config_path")
@@ -308,6 +322,7 @@ def _validate_artifacts(
             except Exception as exception:
                 failures.append(f"invalid_manifest_artifact:{run_id}:{field}:{type(exception).__name__}")
 
+    metric_artifacts_valid = True
     metrics = record["metrics"]
     for split in ("validation", "test", "train"):
         path_field = f"{split}_corruption_bank_path"
@@ -318,9 +333,30 @@ def _validate_artifacts(
                 bank = load_corruption_bank(path)
                 if bank.bank_hash != metrics.get(hash_field):
                     failures.append(f"corruption_artifact:{run_id}:{split}")
+                    metric_artifacts_valid = False
             except Exception as exception:
                 failures.append(f"invalid_corruption_artifact:{run_id}:{split}:{type(exception).__name__}")
-    return resume_state_valid
+                metric_artifacts_valid = False
+        else:
+            metric_artifacts_valid = False
+
+    figure_path = paths.get("nearest_neighbor_grid_path")
+    figure_valid = not neighbors_required
+    if neighbors_required and figure_path is not None:
+        expected_hash = str(metadata.get("nearest_neighbor_grid_hash", ""))
+        actual_hash = _hash(figure_path)
+        figure_valid = bool(re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash) and expected_hash == actual_hash)
+        if not figure_valid:
+            failures.append(f"figure_artifact:{run_id}:nearest_neighbor_grid_hash")
+    return {
+        "resume_state": resume_state_valid,
+        "checkpoint": bool(last_path is not None and best_path is not None),
+        "sample": sample_path is not None,
+        "metric": metric_artifacts_valid,
+        "nearest_neighbor": bool(not neighbors_required or figure_path is not None),
+        "figure": figure_valid,
+        "provenance": bool(run_config_path is not None),
+    }
 
 
 def _validate_provenance(
@@ -365,18 +401,62 @@ def _validate_provenance(
     ):
         if not metadata.get(field):
             failures.append(f"result_metadata_provenance:{run_id}:{field}")
+    for field in (
+        "dataset_identity_hash",
+        "dataset_content_hash",
+        "target_similarity_reference_hash",
+        "similarity_metric_reference_hash",
+    ):
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", str(metadata.get(field, ""))):
+            failures.append(f"result_metadata_provenance:{run_id}:{field}")
+    auxiliary_refs = metadata.get("auxiliary_similarity_reference_hashes")
+    selected_refs = metadata.get("selected_auxiliary_similarity_reference_hashes")
+    if not isinstance(auxiliary_refs, Mapping) or not isinstance(selected_refs, Mapping):
+        failures.append(f"result_metadata_provenance:{run_id}:similarity_references")
+    else:
+        try:
+            selected_labels = list(json.loads(str(expected.get("aux_composition", "[]"))))
+        except json.JSONDecodeError:
+            selected_labels = []
+        expected_selected = {label: auxiliary_refs.get(label) for label in selected_labels}
+        if dict(selected_refs) != expected_selected or any(
+            not re.fullmatch(r"[0-9a-fA-F]{64}", str(value or ""))
+            for value in expected_selected.values()
+        ):
+            failures.append(f"result_metadata_provenance:{run_id}:selected_similarity_references")
+        expected_metric_reference = canonical_sha256(
+            {
+                "split": "dedicated_similarity_reference",
+                "target": metadata.get("target_similarity_reference_hash"),
+                "auxiliary": expected_selected,
+            }
+        )
+        if metadata.get("similarity_metric_reference_hash") != expected_metric_reference:
+            failures.append(f"result_metadata_provenance:{run_id}:similarity_metric_reference_hash")
     environment = metadata.get("environment_report")
     if not isinstance(environment, Mapping):
         failures.append(f"result_metadata_provenance:{run_id}:environment_report")
     else:
-        if environment.get("environment_lock_hash") != expected.get("environment_lock_hash"):
+        try:
+            validate_environment_report(dict(environment))
+        except ValueError:
+            failures.append(f"result_metadata_provenance:{run_id}:environment_report_hash")
+        if environment.get("source_environment_spec_hash") != expected.get("environment_lock_hash"):
+            failures.append(f"result_metadata_provenance:{run_id}:environment_source_spec")
+        if environment.get("environment_lock_hash") != expected.get("exact_environment_lock_hash") or (
+            environment.get("exact_environment_lock_hash") != expected.get("exact_environment_lock_hash")
+        ):
             failures.append(f"result_metadata_provenance:{run_id}:environment_report_lock")
         if not bool(environment.get("lock_matches_runtime", False)):
             failures.append(f"result_metadata_provenance:{run_id}:environment_runtime_mismatch")
         if environment.get("environment_runtime_hash") != metadata.get("environment_runtime_hash"):
             failures.append(f"result_metadata_provenance:{run_id}:environment_runtime_hash")
+        if environment.get("environment_report_hash") != metadata.get("environment_report_hash"):
+            failures.append(f"result_metadata_provenance:{run_id}:environment_report_hash")
     if not metadata.get("environment_runtime_hash"):
         failures.append(f"result_metadata_provenance:{run_id}:environment_runtime_hash")
+    if not metadata.get("environment_report_hash"):
+        failures.append(f"result_metadata_provenance:{run_id}:environment_report_hash")
     for field in ("wallclock_total_seconds", "peak_gpu_memory_bytes"):
         if not _finite(metadata.get(field)) or float(metadata.get(field, 0)) <= 0:
             failures.append(f"runtime_metadata:{run_id}:{field}")
@@ -417,14 +497,23 @@ def _validate_metrics_and_counters(
         if not is_baseline and auxiliary_seen <= 0:
             failures.append(f"exposure_counters:{run_id}:auxiliary")
 
-    for field in ("final_objective_train_loss", "final_pooled_train_loss", "final_target_batch_train_loss"):
+    for field in ("final_objective_train_loss", "final_pooled_train_loss"):
         if not _finite(training.get(field)):
             failures.append(f"nonfinite:{run_id}:{field}")
+    actual_target_batch = int(training.get("actual_target_batch_size", -1))
+    actual_auxiliary_batch = int(training.get("actual_auxiliary_batch_size", -1))
+    if actual_target_batch > 0 and not _finite(training.get("final_target_batch_train_loss")):
+        failures.append(f"nonfinite:{run_id}:final_target_batch_train_loss")
     for field in ("wallclock_train_seconds", "images_processed_per_second"):
         if not _finite(training.get(field)) or float(training.get(field, 0)) <= 0:
             failures.append(f"runtime_metadata:{run_id}:{field}")
-    if not is_baseline and not _finite(training.get("final_auxiliary_batch_train_loss")):
+    if not is_baseline and actual_auxiliary_batch > 0 and not _finite(training.get("final_auxiliary_batch_train_loss")):
         failures.append(f"nonfinite:{run_id}:final_auxiliary_batch_train_loss")
+    for field in ("rolling_pooled_train_loss", "rolling_target_train_loss"):
+        if not _finite(training.get(field)):
+            failures.append(f"nonfinite:{run_id}:{field}")
+    if not is_baseline and auxiliary_seen > 0 and not _finite(training.get("rolling_auxiliary_train_loss")):
+        failures.append(f"nonfinite:{run_id}:rolling_auxiliary_train_loss")
     for field in ("validation_epsilon_mse_target", "test_epsilon_mse_target"):
         source = training if field.startswith("validation") else metrics
         if not _finite(source.get(field)):
@@ -546,20 +635,158 @@ def _validate_pairing(
                 continue
             pair_count += 1
             candidate_metadata = candidate_record["metadata"]
-            for field in (
+            identity_fields = [
                 "split_manifest_hash",
-                "subset_manifest_hash",
-                "target_training_subset_hash",
                 "paired_target_prefix_hash",
                 "target_eval_indices_hash",
                 "target_validation_indices_hash",
+            ]
+            # Experiment B intentionally gives its baseline a larger target
+            # subset.  Pairing is established by the shared target prefix, not
+            # by pretending the complete subset manifests are identical.
+            if str(candidate.get("experiment")) != "B":
+                identity_fields.extend(("subset_manifest_hash", "target_training_subset_hash"))
+            elif _csv_text(candidate.get("baseline_target_count")) != _csv_text(
+                baselines[0].get("baseline_target_count")
             ):
+                failures.append(f"pair_identity:{candidate['run_id']}:baseline_target_count")
+            for field in identity_fields:
                 if candidate_metadata.get(field) != baseline_metadata.get(field):
                     failures.append(f"pair_identity:{candidate['run_id']}:{field}")
             for field in ("validation_corruption_bank_hash", "test_corruption_bank_hash"):
                 if candidate_record["metrics"].get(field) != baseline_record["metrics"].get(field):
                     failures.append(f"pair_identity:{candidate['run_id']}:{field}")
     return pair_count
+
+
+def _resolve_evidence_path(config_path: str | Path, value: Any) -> Path:
+    expanded = str(resolve_env_path(None if value is None else str(value)) or "")
+    if not expanded or "$" in expanded:
+        raise ValueError("evidence path is unresolved")
+    path = Path(expanded).expanduser()
+    return path if path.is_absolute() else (Path(config_path).resolve().parent / path).resolve()
+
+
+def _validate_external_runtime_evidence(
+    config_path: str | Path,
+    resolved: ResolvedConfig,
+    failures: list[str],
+) -> dict[str, Any]:
+    config = resolved.resolved
+    evidence: dict[str, Any] = {}
+    try:
+        environment_path = _resolve_evidence_path(config_path, config.get("environment_runtime_report_path"))
+        environment = load_json(environment_path)
+        validate_environment_report(environment)
+        if not bool(environment.get("exact_environment_lock")):
+            failures.append("environment_evidence:not_exact_lock")
+        if not bool(environment.get("lock_matches_runtime")):
+            failures.append("environment_evidence:runtime_mismatch")
+        if not bool(environment.get("cuda_available")):
+            failures.append("environment_evidence:cuda_unavailable")
+        exact_lock_path = _resolve_evidence_path(config_path, config.get("exact_environment_lock_path"))
+        expected_lock_hash = _hash(exact_lock_path)
+        if environment.get("environment_lock_hash") != expected_lock_hash or (
+            environment.get("exact_environment_lock_hash") != expected_lock_hash
+        ):
+            failures.append("environment_evidence:lock_hash")
+        evidence["environment_report_path"] = str(environment_path)
+        evidence["environment_runtime_hash"] = environment.get("environment_runtime_hash")
+        evidence["environment_report_hash"] = environment.get("environment_report_hash")
+        evidence["exact_environment_lock_hash"] = environment.get("exact_environment_lock_hash")
+    except Exception as exception:
+        environment = {}
+        failures.append(f"environment_evidence:{type(exception).__name__}:{exception}")
+
+    for field, probe_type in (("gpu_runtime_probe_path", "gpu_load"), ("resume_probe_path", "resume")):
+        try:
+            path = _resolve_evidence_path(config_path, config.get(field))
+            probe = load_json(path)
+            expected_probe_hash = canonical_json_hash(
+                {key: value for key, value in probe.items() if key not in {"created_at", "probe_hash"}}
+            )
+            if probe.get("schema_version") != "3.0" or probe.get("probe_type") != probe_type:
+                failures.append(f"runtime_probe:{probe_type}:schema")
+            if probe.get("probe_hash") != expected_probe_hash:
+                failures.append(f"runtime_probe:{probe_type}:hash")
+            if probe.get("passed") is not True or probe.get("runtime_probe_failures") != []:
+                failures.append(f"runtime_probe:{probe_type}:failed")
+            if probe.get("resolved_config_hash") != resolved.resolved_hash:
+                failures.append(f"runtime_probe:{probe_type}:config_hash")
+            if probe.get("model_config_hash") != resolved.model_hash:
+                failures.append(f"runtime_probe:{probe_type}:model_hash")
+            if probe.get("environment_runtime_hash") != environment.get("environment_runtime_hash"):
+                failures.append(f"runtime_probe:{probe_type}:environment_runtime_hash")
+            if probe.get("environment_report_hash") != environment.get("environment_report_hash"):
+                failures.append(f"runtime_probe:{probe_type}:environment_report_hash")
+            if probe.get("git_sha") != environment.get("git_sha"):
+                failures.append(f"runtime_probe:{probe_type}:git_sha")
+            protocol_results = probe.get("protocol_results") or {}
+            if set(protocol_results) != set(PROTOCOLS):
+                failures.append(f"runtime_probe:{probe_type}:protocols")
+            if probe_type == "gpu_load":
+                if probe.get("cuda_available") is not True:
+                    failures.append("runtime_probe:gpu_load:cuda")
+                training = config.get("training") or {}
+                minimum_headroom = int(training.get("minimum_gpu_headroom_bytes", 0))
+                for protocol in PROTOCOLS:
+                    result = protocol_results.get(protocol) or {}
+                    expected_target = int(
+                        training.get(
+                            "batch_size" if protocol == "natural_compute_matched" else "target_batch_size",
+                            training.get("batch_size", 1),
+                        )
+                    )
+                    expected_auxiliary = 0 if protocol == "natural_compute_matched" else int(
+                        training.get("auxiliary_batch_size", training.get("batch_size", 1))
+                    )
+                    if int(result.get("target_batch_size", -1)) != expected_target:
+                        failures.append(f"runtime_probe:gpu_load:{protocol}:target_batch_size")
+                    if int(result.get("auxiliary_batch_size", -1)) != expected_auxiliary:
+                        failures.append(f"runtime_probe:gpu_load:{protocol}:auxiliary_batch_size")
+                    if int(result.get("gpu_headroom_bytes", -1)) < minimum_headroom:
+                        failures.append(f"runtime_probe:gpu_load:{protocol}:headroom")
+                    if str(training.get("precision", "fp32")) == "amp" and not (
+                        result.get("amp_enabled") and result.get("grad_scaler_enabled")
+                    ):
+                        failures.append(f"runtime_probe:gpu_load:{protocol}:amp")
+                    if result.get("step_finite") is not True:
+                        failures.append(f"runtime_probe:gpu_load:{protocol}:nonfinite")
+            else:
+                if not str(probe.get("device", "")).startswith("cuda"):
+                    failures.append("runtime_probe:resume:cuda")
+                for protocol in PROTOCOLS:
+                    result = protocol_results.get(protocol) or {}
+                    if not all(
+                        result.get(key) is True
+                        for key in (
+                            "checkpoint_saved",
+                            "objects_destroyed_before_restore",
+                            "raw_model_matches",
+                            "ema_model_matches",
+                            "raw_model_state_restored",
+                            "ema_model_state_restored",
+                            "optimizer_state_restored",
+                            "grad_scaler_state_restored",
+                            "raw_not_loaded_from_ema",
+                            "global_step_continuous",
+                            "sampler_position_continuous",
+                            "exposure_counters_restored",
+                            "exposure_counters_continuous",
+                            "loss_sequence_matches",
+                            "passed",
+                        )
+                    ):
+                        failures.append(f"runtime_probe:resume:{protocol}:state")
+                    if result.get("global_step_restored") != 1 or result.get("global_step_after_continue") != 2:
+                        failures.append(f"runtime_probe:resume:{protocol}:global_step")
+                    if result.get("sampler_position_restored") != 1 or result.get("sampler_position_after_continue") != 2:
+                        failures.append(f"runtime_probe:resume:{protocol}:sampler_position")
+            evidence[f"{probe_type}_probe_path"] = str(path)
+            evidence[f"{probe_type}_probe_hash"] = probe.get("probe_hash")
+        except Exception as exception:
+            failures.append(f"runtime_probe:{probe_type}:{type(exception).__name__}:{exception}")
+    return evidence
 
 
 def validate_pilot(config_path: str | Path, jobs_csv: str | Path, results_root: str | Path) -> dict[str, Any]:
@@ -574,6 +801,18 @@ def validate_pilot(config_path: str | Path, jobs_csv: str | Path, results_root: 
     if not expected_rows:
         raise ValueError("Release-pilot config produces no explicitly enabled jobs")
     jobs, failures = _read_and_compare_grid(jobs_csv, expected_rows)
+    runtime_evidence = _validate_external_runtime_evidence(config_path, resolved, failures)
+    try:
+        dataset_identity_path = _resolve_evidence_path(
+            config_path, resolved.resolved.get("dataset_identity_path")
+        )
+        dataset_identity = verify_dataset_identity_file(resolved.resolved, dataset_identity_path)
+        runtime_evidence["dataset_identity_path"] = str(dataset_identity_path)
+        runtime_evidence["dataset_identity_hash"] = dataset_identity["dataset_identity_hash"]
+        runtime_evidence["dataset_content_hash"] = dataset_identity["dataset_content_hash"]
+    except Exception as exception:
+        dataset_identity = {}
+        failures.append(f"dataset_identity:{type(exception).__name__}:{exception}")
     root = Path(results_root)
     configured_root = Path(str(resolve_env_path(resolved.resolved.get("output_root"), "image_transfer_results")))
     if root.resolve() != configured_root.resolve():
@@ -590,7 +829,15 @@ def validate_pilot(config_path: str | Path, jobs_csv: str | Path, results_root: 
     for path in sorted(failure_dir.glob("*.json")) if failure_dir.exists() else []:
         failures.append(f"failure_record_present:{path.stem}")
 
-    resume_state_validated = 0
+    artifact_counts = {
+        "resume_state": 0,
+        "checkpoint": 0,
+        "sample": 0,
+        "metric": 0,
+        "nearest_neighbor": 0,
+        "figure": 0,
+        "provenance": 0,
+    }
 
     for run_id, expected in expected_by_id.items():
         result_path = result_dir / f"{run_id}.json"
@@ -607,10 +854,15 @@ def validate_pilot(config_path: str | Path, jobs_csv: str | Path, results_root: 
             failures.append(f"not_completed:{run_id}")
             continue
         records[run_id] = record
+        if record["metadata"].get("dataset_identity_hash") != dataset_identity.get("dataset_identity_hash"):
+            failures.append(f"result_metadata_provenance:{run_id}:dataset_identity_hash")
+        if record["metadata"].get("dataset_content_hash") != dataset_identity.get("dataset_content_hash"):
+            failures.append(f"result_metadata_provenance:{run_id}:dataset_content_hash")
         _validate_provenance(expected, record, failures)
         _validate_metrics_and_counters(expected, record, resolved.resolved, failures)
-        if _validate_artifacts(expected, record, resolved.resolved, failures):
-            resume_state_validated += 1
+        artifact_outcomes = _validate_artifacts(expected, record, resolved.resolved, failures)
+        for field, valid in artifact_outcomes.items():
+            artifact_counts[field] += int(valid)
 
     pair_count = _validate_pairing(expected_rows, records, failures)
     git_shas = {str(record["metadata"].get("git_sha", "")) for record in records.values()}
@@ -622,13 +874,14 @@ def validate_pilot(config_path: str | Path, jobs_csv: str | Path, results_root: 
     failures = list(dict.fromkeys(failures))
     status = "passed" if not failures and bool(expected_rows) else "failed"
     return {
-        "schema_version": "2.0",
+        "schema_version": "3.0",
         "status": status,
         "meaning": "engineering health only; this does not validate a scientific hypothesis",
         "git_sha": validated_git_sha,
         "model_config_hash": resolved.model_hash,
         "target_set_hash": resolved.target_set_hash,
         "environment_lock_hash": resolved.environment_lock_hash,
+        **runtime_evidence,
         "study_plan_hash": resolved.study_plan_hash,
         "pilot_config_hash": resolved.resolved_hash,
         "expected_job_grid_hash": canonical_sha256(expected_rows),
@@ -638,7 +891,13 @@ def validate_pilot(config_path: str | Path, jobs_csv: str | Path, results_root: 
         "supplied_jobs": len(jobs),
         "validated_jobs": len(records),
         "validated_pairs": pair_count,
-        "resume_state_validated_jobs": resume_state_validated,
+        "resume_state_validated_jobs": artifact_counts["resume_state"],
+        "checkpoint_artifacts_validated_jobs": artifact_counts["checkpoint"],
+        "sample_artifacts_validated_jobs": artifact_counts["sample"],
+        "metric_artifacts_validated_jobs": artifact_counts["metric"],
+        "nearest_neighbor_artifacts_validated_jobs": artifact_counts["nearest_neighbor"],
+        "figure_artifacts_validated_jobs": artifact_counts["figure"],
+        "provenance_artifacts_validated_jobs": artifact_counts["provenance"],
         "failures": failures,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }

@@ -81,11 +81,17 @@ def enforce_readiness_gate(
     if status.get("status") == "passed":
         expected_jobs = status.get("expected_jobs")
         evidence_valid = (
-            status.get("schema_version") == "2.0"
+            status.get("schema_version") == "3.0"
             and type(expected_jobs) is int
             and expected_jobs > 0
             and status.get("validated_jobs") == expected_jobs
             and status.get("resume_state_validated_jobs") == expected_jobs
+            and status.get("checkpoint_artifacts_validated_jobs") == expected_jobs
+            and status.get("sample_artifacts_validated_jobs") == expected_jobs
+            and status.get("metric_artifacts_validated_jobs") == expected_jobs
+            and status.get("nearest_neighbor_artifacts_validated_jobs") == expected_jobs
+            and status.get("figure_artifacts_validated_jobs") == expected_jobs
+            and status.get("provenance_artifacts_validated_jobs") == expected_jobs
             and type(status.get("validated_pairs")) is int
             and status.get("validated_pairs", 0) > 0
             and isinstance(status.get("validated_result_hashes"), Mapping)
@@ -97,6 +103,11 @@ def enforce_readiness_gate(
             and status.get("failures") == []
             and bool(re.fullmatch(r"[0-9a-fA-F]{64}", str(status.get("expected_job_grid_hash", ""))))
             and bool(re.fullmatch(r"[0-9a-fA-F]{64}", str(status.get("jobs_csv_hash", ""))))
+            and bool(re.fullmatch(r"[0-9a-fA-F]{64}", str(status.get("environment_runtime_hash", ""))))
+            and bool(re.fullmatch(r"[0-9a-fA-F]{64}", str(status.get("environment_report_hash", ""))))
+            and bool(re.fullmatch(r"[0-9a-fA-F]{64}", str(status.get("exact_environment_lock_hash", ""))))
+            and bool(re.fullmatch(r"[0-9a-fA-F]{64}", str(status.get("gpu_load_probe_hash", ""))))
+            and bool(re.fullmatch(r"[0-9a-fA-F]{64}", str(status.get("resume_probe_hash", ""))))
         )
         if not evidence_valid:
             mismatches.append("validation_evidence")

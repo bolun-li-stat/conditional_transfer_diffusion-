@@ -19,12 +19,21 @@ JOBS_CSV=$1
 : "${RESULTS_ROOT:?export RESULTS_ROOT before submitting}"
 : "${TORCH_HOME:?export TORCH_HOME before submitting}"
 : "${METRIC_ASSETS_MANIFEST:?export METRIC_ASSETS_MANIFEST before submitting}"
+: "${EXACT_ENVIRONMENT_LOCK_PATH:?export EXACT_ENVIRONMENT_LOCK_PATH before submitting}"
+: "${ENVIRONMENT_RUNTIME_REPORT_PATH:?export ENVIRONMENT_RUNTIME_REPORT_PATH before submitting}"
+: "${DATASET_IDENTITY_PATH:?export DATASET_IDENTITY_PATH before submitting}"
+: "${GPU_RUNTIME_PROBE_PATH:?export GPU_RUNTIME_PROBE_PATH before submitting}"
+: "${RESUME_PROBE_PATH:?export RESUME_PROBE_PATH before submitting}"
 : "${SLURM_ARRAY_TASK_ID:?submit this script as an array job}"
 
 export PYTHONUNBUFFERED=1
 cd "$PROJECT_ROOT"
-python -m image_transfer.scripts.run_job \
-  --jobs-csv "$JOBS_CSV" \
-  --job-index "$SLURM_ARRAY_TASK_ID" \
-  --device cuda \
-  --resume
+RUN_ARGS=(
+  --jobs-csv "$JOBS_CSV"
+  --job-index "$SLURM_ARRAY_TASK_ID"
+  --device cuda
+)
+if [[ "${IMAGE_TRANSFER_RESUME:-0}" == "1" ]]; then
+  RUN_ARGS+=(--resume)
+fi
+python -m image_transfer.scripts.run_job "${RUN_ARGS[@]}"

@@ -12,13 +12,14 @@ from typing import Any
 import torch
 
 from image_transfer.config import load_resolved_config
+from image_transfer.data.dataset_identity import build_dataset_identity, verify_dataset_identity_file
 from image_transfer.evaluation.classifier_fidelity import imagenet_synset_to_index
-from image_transfer.models import build_image_model, model_parameter_metadata
 from image_transfer.readiness import enforce_readiness_gate
-from image_transfer.scripts.inspect_environment import inspect_environment
+from image_transfer.scripts.inspect_environment import inspect_environment, validate_environment_report
 from image_transfer.scripts.make_job_grid import job_breakdown, rows_for_experiment
 from image_transfer.scripts.prepare_metric_assets import initialize_backends_offline, verify_manifest
-from image_transfer.utils.io import atomic_write_json, resolve_env_path
+from image_transfer.training.runtime_probe import PROTOCOLS, run_load_probe
+from image_transfer.utils.io import atomic_write_json, atomic_write_text, load_json, resolve_env_path
 
 
 def _check(name: str, ok: bool, details: Any, *, required: bool = True) -> dict[str, Any]:
@@ -104,17 +105,49 @@ def run_preflight(
     resolved = load_resolved_config(config_path)
     cfg = resolved.resolved
     checks: list[dict[str, Any]] = []
-    lock_path = cfg.get("environment_lock_path", "environment/requirements-image-lock.txt")
-    lock = Path(lock_path)
+    source_lock_path = resolve_env_path(
+        str(cfg.get("environment_lock_path", "environment/requirements-image-lock.txt"))
+    ) or "environment/requirements-image-lock.txt"
+    exact_lock_path = resolve_env_path(
+        None if cfg.get("exact_environment_lock_path") is None else str(cfg.get("exact_environment_lock_path"))
+    ) or source_lock_path
+    lock = Path(str(exact_lock_path))
     if not lock.is_absolute():
         candidate = (Path(config_path).resolve().parent / lock).resolve()
-        lock = candidate if candidate.exists() else Path(lock_path).resolve()
-    environment = inspect_environment(lock)
-    environment_ok = (
+        lock = candidate if candidate.exists() else Path(str(exact_lock_path)).resolve()
+    source_lock = Path(str(source_lock_path))
+    if not source_lock.is_absolute():
+        candidate = (Path(config_path).resolve().parent / source_lock).resolve()
+        source_lock = candidate if candidate.exists() else Path(str(source_lock_path)).resolve()
+    configured_runtime_report = cfg.get("environment_runtime_report_path")
+    runtime_report_error = ""
+    if configured_runtime_report:
+        runtime_report_path = Path(str(resolve_env_path(str(configured_runtime_report)) or ""))
+        if not runtime_report_path.is_absolute():
+            runtime_report_path = (Path(config_path).resolve().parent / runtime_report_path).resolve()
+        try:
+            environment = load_json(runtime_report_path)
+            validate_environment_report(environment)
+        except Exception as exception:
+            environment = inspect_environment(lock, source_spec_path=source_lock)
+            runtime_report_error = f"{type(exception).__name__}: {exception}"
+    else:
+        environment = inspect_environment(lock, source_spec_path=source_lock)
+    mode = str(cfg.get("evaluation", {}).get("mode", "debug"))
+    environment_ok = bool(
         environment["environment_lock_hash"] != "missing"
-        and bool(environment.get("lock_matches_runtime", False))
+        and environment.get("lock_matches_runtime", False)
+        and not runtime_report_error
+        and (mode != "strict" or environment.get("exact_environment_lock", False))
     )
-    checks.append(_check("environment_lock", environment_ok, environment))
+    checks.append(
+        _check(
+            "environment_identity",
+            environment_ok,
+            {**environment, "configured_runtime_report_error": runtime_report_error},
+            required=mode == "strict",
+        )
+    )
     checks.append(_check("git_clean", not environment["git_dirty"], {"git_sha": environment["git_sha"], "dirty": environment["git_dirty"]}, required=False))
 
     requires_cuda = (
@@ -149,32 +182,24 @@ def run_preflight(
         )
     )
 
-    try:
-        device = torch.device("cuda" if requires_cuda and torch.cuda.is_available() else "cpu")
-        if device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(device)
-        model = build_image_model(
-            cfg["model"], image_size=int(cfg["image_size"]), conditional=True, num_classes=2, model_seed=0
-        ).to(device)
-        size = int(cfg["image_size"])
-        x = torch.randn(1, 3, size, size, device=device)
-        output = model(
-            x,
-            torch.zeros(1, dtype=torch.long, device=device),
-            torch.zeros(1, dtype=torch.long, device=device),
-        )
-        output.mean().backward()
-        model_details = model_parameter_metadata(model)
-        model_details["device"] = str(device)
-        model_details["peak_gpu_memory_bytes"] = (
-            int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0
-        )
-        model_ok = output.shape == x.shape and all(
-            parameter.grad is None or torch.isfinite(parameter.grad).all() for parameter in model.parameters()
-        )
-    except Exception as exception:
-        model_ok, model_details = False, f"{type(exception).__name__}: {exception}"
-    checks.append(_check("model_forward_backward", model_ok, model_details))
+    configured_loads: dict[str, Any] = {}
+    configured_load_failures: list[str] = []
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if requires_cuda and device.type != "cuda":
+        configured_load_failures.append("CUDA unavailable; configured GPU load was not executed")
+    else:
+        for protocol in PROTOCOLS:
+            try:
+                configured_loads[protocol] = run_load_probe(cfg, device=device, protocol=protocol)
+            except Exception as exception:
+                configured_load_failures.append(f"{protocol}:{type(exception).__name__}:{exception}")
+    model_ok = not configured_load_failures and len(configured_loads) == len(PROTOCOLS)
+    model_details: Any = {
+        "protocol_results": configured_loads,
+        "failures": configured_load_failures,
+        "configured_batch_sizes_exercised": model_ok,
+    }
+    checks.append(_check("configured_training_load", model_ok, model_details))
 
     diffusion_steps = int(cfg.get("diffusion", {}).get("timesteps", 1000))
     sample_steps = int(cfg.get("sampling", {}).get("steps", diffusion_steps))
@@ -205,6 +230,41 @@ def run_preflight(
             asset_ok, asset_details = False, f"{type(exception).__name__}: {exception}"
     checks.append(_check("offline_metric_assets", asset_ok, asset_details))
 
+    for check_name, config_field, probe_type in (
+        ("gpu_runtime_probe", "gpu_runtime_probe_path", "gpu_load"),
+        ("resume_probe", "resume_probe_path", "resume"),
+    ):
+        required = mode == "strict"
+        path_value = cfg.get(config_field)
+        probe_ok = not required
+        probe_details: Any = "not required in debug mode"
+        if path_value:
+            try:
+                expanded = str(resolve_env_path(str(path_value)) or "")
+                probe_path = Path(expanded).expanduser()
+                if not probe_path.is_absolute():
+                    probe_path = (Path(config_path).resolve().parent / probe_path).resolve()
+                probe = load_json(probe_path)
+                protocol_results = probe.get("protocol_results") or {}
+                probe_ok = bool(
+                    probe.get("schema_version") == "3.0"
+                    and probe.get("probe_type") == probe_type
+                    and probe.get("passed") is True
+                    and probe.get("resolved_config_hash") == resolved.resolved_hash
+                    and probe.get("environment_runtime_hash") == environment.get("environment_runtime_hash")
+                    and probe.get("environment_report_hash") == environment.get("environment_report_hash")
+                    and set(protocol_results) == set(PROTOCOLS)
+                    and all(bool(result.get("passed", True)) for result in protocol_results.values())
+                    and (probe_type != "gpu_load" or probe.get("cuda_available") is True)
+                    and (probe_type != "resume" or str(probe.get("device", "")).startswith("cuda"))
+                )
+                probe_details = {"path": str(probe_path), "report": probe}
+            except Exception as exception:
+                probe_ok, probe_details = False, f"{type(exception).__name__}: {exception}"
+        elif required:
+            probe_ok, probe_details = False, f"{config_field} is required in strict mode"
+        checks.append(_check(check_name, probe_ok, probe_details, required=required))
+
     expanded_data_root = str(resolve_env_path(cfg.get("data_root"), "") or "")
     data_root = Path(expanded_data_root).expanduser() if expanded_data_root else Path(".")
     data_ok = bool(cfg.get("use_fake_data")) or (
@@ -214,6 +274,33 @@ def run_preflight(
         and data_root.resolve() != Path.cwd().resolve()
     )
     checks.append(_check("dataset_root", data_ok, expanded_data_root or "not configured"))
+    identity_value = cfg.get("dataset_identity_path")
+    try:
+        if identity_value:
+            expanded_identity = str(resolve_env_path(str(identity_value)) or "")
+            identity_path = Path(expanded_identity).expanduser()
+            if not identity_path.is_absolute():
+                identity_path = (Path(config_path).resolve().parent / identity_path).resolve()
+            identity = verify_dataset_identity_file(cfg, identity_path)
+            identity_details: Any = {
+                "path": str(identity_path),
+                "dataset_identity_hash": identity["dataset_identity_hash"],
+                "dataset_content_hash": identity["dataset_content_hash"],
+            }
+            identity_ok = True
+        elif bool(cfg.get("use_fake_data")) and mode != "strict":
+            identity = build_dataset_identity(cfg)
+            identity_details = {
+                "logical_synthetic_identity": True,
+                "dataset_identity_hash": identity["dataset_identity_hash"],
+                "dataset_content_hash": identity["dataset_content_hash"],
+            }
+            identity_ok = True
+        else:
+            identity_ok, identity_details = False, "dataset_identity_path is required"
+    except Exception as exception:
+        identity_ok, identity_details = False, f"{type(exception).__name__}: {exception}"
+    checks.append(_check("dataset_identity", identity_ok, identity_details))
     expanded_output_root = str(resolve_env_path(cfg.get("output_root"), "image_transfer_results") or "")
     output_root = Path(expanded_output_root) if expanded_output_root else Path(".")
     try:
@@ -274,7 +361,9 @@ def run_preflight(
         target = str(row["target_synset"])
         target_counts = class_counts.get(target, {"train": 0, "eval": 0})
         target_reserve = (
-            int(split.get("target_eval_size", 0)) + int(split.get("target_val_size", 0))
+            int(split.get("target_eval_size", 0))
+            + int(split.get("target_val_size", 0))
+            + int(split.get("target_similarity_reference_size", 0))
             if source == "train_holdout"
             else 0
         )
@@ -293,7 +382,12 @@ def run_preflight(
             feasibility_failures.append(f"{row['run_id']}:aux_composition")
         for label in auxiliary:
             counts = class_counts.get(str(label), {"train": 0, "eval": 0})
-            auxiliary_reserve = int(split.get("auxiliary_eval_size", 0)) if source == "train_holdout" else 0
+            auxiliary_reserve = (
+                int(split.get("auxiliary_eval_size", 0))
+                + int(split.get("auxiliary_similarity_reference_size", 0))
+                if source == "train_holdout"
+                else 0
+            )
             if int(counts.get("train", 0)) - auxiliary_reserve < int(row["m_per_aux"]):
                 feasibility_failures.append(f"{row['run_id']}:auxiliary:{label}")
             if source != "train_holdout" and int(counts.get("eval", 0)) < int(
@@ -338,16 +432,20 @@ def run_preflight(
         except OSError:
             pass
     storage = job_breakdown(jobs, cfg) if jobs else {"estimated_jobs": 0, "estimated_sample_storage_bytes": 0}
-    storage_ok = disk.free > int(storage.get("estimated_sample_storage_bytes", 0)) + 1024**3
+    storage_ok = disk.free > int(
+        storage.get("estimated_total_storage_bytes", storage.get("estimated_sample_storage_bytes", 0))
+    ) + 1024**3
     checks.append(_check("estimated_storage", storage_ok, {**storage, "free_bytes": disk.free}))
     strict_no_fallback = mode != "strict" or asset_ok
     checks.append(_check("strict_no_fallback", strict_no_fallback, {"mode": mode, "assets_verified": asset_ok}))
 
     parameter_counts: dict[str, int] = {}
-    if isinstance(model_details, dict):
-        backbone = int(model_details.get("backbone_parameter_count", 0))
-        two_class_conditioning = int(model_details.get("conditioning_parameter_count", 0))
-        per_class = two_class_conditioning // 2 if two_class_conditioning else 0
+    representative = next(iter(configured_loads.values()), {})
+    if isinstance(representative, dict):
+        backbone = int(representative.get("backbone_parameter_count", 0))
+        max_class_conditioning = int(representative.get("conditioning_parameter_count", 0))
+        probed_classes = int(representative.get("num_classes", 0))
+        per_class = max_class_conditioning // probed_classes if probed_classes else 0
         for row in jobs:
             model_type = str(row["model_type"])
             if model_type.startswith("unconditional"):
@@ -361,7 +459,7 @@ def run_preflight(
 
     required_failures = [item for item in checks if item["required"] and item["status"] == "fail"]
     report = {
-        "schema_version": "2.0",
+        "schema_version": "3.0",
         "status": "ready" if not required_failures else "not_ready",
         "config_path": str(config_path),
         "config_provenance": resolved.provenance(),
@@ -373,7 +471,7 @@ def run_preflight(
     atomic_write_json(report, destination / "preflight_report.json")
     lines = [f"# Preflight: {report['status']}", ""]
     lines.extend(f"- {item['status'].upper()}: {item['name']} — {item['details']}" for item in checks)
-    (destination / "preflight_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text("\n".join(lines) + "\n", destination / "preflight_report.md")
     return report
 
 

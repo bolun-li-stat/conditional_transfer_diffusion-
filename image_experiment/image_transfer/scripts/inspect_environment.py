@@ -18,10 +18,34 @@ from packaging.version import InvalidVersion, Version
 import torch
 import yaml
 
+from image_transfer.environment_lock import (
+    compare_exact_environment_lock,
+    installed_pip_packages,
+    load_exact_environment_lock,
+)
 from image_transfer.utils.io import atomic_write_json, canonical_json_hash, get_git_sha
 
 
-ENVIRONMENT_REPORT_SCHEMA_VERSION = "2.0"
+ENVIRONMENT_REPORT_SCHEMA_VERSION = "3.0"
+RUNTIME_IDENTITY_FIELDS = (
+    "schema_version",
+    "source_environment_spec_hash",
+    "exact_environment_lock_hash",
+    "python_version",
+    "packages",
+    "os",
+    "cuda_available",
+    "torch_cuda_build",
+    "cudnn_version",
+    "gpu_names",
+    "driver_version",
+    "deterministic_algorithms",
+    "cudnn_deterministic",
+    "cudnn_benchmark",
+    "tf32_matmul_allowed",
+    "tf32_cudnn_allowed",
+    "amp_dtype",
+)
 PACKAGES = [
     "torch", "torchvision", "torchmetrics", "torch-fidelity", "numpy", "scipy", "pandas",
     "matplotlib", "Pillow", "PyYAML", "pytest", "scikit-learn", "tqdm",
@@ -104,13 +128,12 @@ def _parse_environment_definition(path: Path) -> tuple[dict[str, str], dict[str,
 
 
 def _installed_packages() -> dict[str, str]:
-    packages: dict[str, str] = {}
+    # Bind the identity to the complete distribution set.  Retaining explicit
+    # missing values for project-critical packages keeps old reports readable.
+    packages = {entry["name"]: entry["version"] for entry in installed_pip_packages()}
     for package in PACKAGES:
-        try:
-            packages[package] = importlib.metadata.version(package)
-        except importlib.metadata.PackageNotFoundError:
-            packages[package] = "missing"
-    return packages
+        packages.setdefault(_canonical_name(package), "missing")
+    return dict(sorted(packages.items()))
 
 
 def _public_version(value: str) -> str:
@@ -150,7 +173,27 @@ def _compare_lock(
     return mismatches
 
 
-def inspect_environment(lock_path: str | Path) -> dict[str, Any]:
+def _report_without_hash(report: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in report.items() if key != "environment_report_hash"}
+
+
+def validate_environment_report(report: dict[str, Any] | Any) -> None:
+    if not isinstance(report, dict):
+        raise ValueError("environment report must be a JSON object")
+    if report.get("schema_version") != ENVIRONMENT_REPORT_SCHEMA_VERSION:
+        raise ValueError("unsupported environment report schema")
+    runtime_identity = {field: report.get(field) for field in RUNTIME_IDENTITY_FIELDS}
+    if report.get("environment_runtime_hash") != canonical_json_hash(runtime_identity):
+        raise ValueError("environment runtime hash mismatch")
+    if report.get("environment_report_hash") != canonical_json_hash(_report_without_hash(report)):
+        raise ValueError("environment report hash mismatch")
+
+
+def inspect_environment(
+    lock_path: str | Path,
+    *,
+    source_spec_path: str | Path | None = None,
+) -> dict[str, Any]:
     lock = Path(lock_path).expanduser().resolve()
     packages = _installed_packages()
     driver = "unavailable"
@@ -169,22 +212,47 @@ def inspect_environment(lock_path: str | Path) -> dict[str, Any]:
     expected: dict[str, str] = {}
     builds: dict[str, str] = {}
     unparsed: list[str] = []
-    if lock.is_file():
+    exact_lock: dict[str, Any] | None = None
+    exact_lock_errors: list[str] = []
+    if lock.is_file() and lock.suffix.lower() == ".json":
         try:
-            expected, builds, unparsed = _parse_environment_definition(lock)
-        except (OSError, yaml.YAMLError) as exception:
-            unparsed = [f"definition parse failed: {type(exception).__name__}: {exception}"]
-    mismatches = _compare_lock(expected, builds, packages) if expected else ["no exact package pins found"]
+            exact_lock = load_exact_environment_lock(lock)
+        except (OSError, ValueError, json.JSONDecodeError) as exception:
+            exact_lock_errors = [f"exact lock parse failed: {type(exception).__name__}: {exception}"]
+    if lock.is_file():
+        if exact_lock is None and not exact_lock_errors:
+            try:
+                expected, builds, unparsed = _parse_environment_definition(lock)
+            except (OSError, yaml.YAMLError) as exception:
+                unparsed = [f"definition parse failed: {type(exception).__name__}: {exception}"]
+    if exact_lock is not None:
+        mismatches = compare_exact_environment_lock(exact_lock)
+    elif exact_lock_errors:
+        mismatches = list(exact_lock_errors)
+    else:
+        mismatches = _compare_lock(expected, builds, packages) if expected else ["no exact package pins found"]
     if unparsed:
         mismatches.extend(f"unpinned or unsupported definition entry: {entry}" for entry in unparsed)
 
     lock_hash = file_sha256(lock) if lock.is_file() else "missing"
+    source_spec = Path(source_spec_path).expanduser().resolve() if source_spec_path else None
+    if exact_lock is not None and source_spec is None and exact_lock.get("source_environment_spec_path"):
+        candidate = Path(str(exact_lock["source_environment_spec_path"])).expanduser()
+        source_spec = candidate if candidate.is_absolute() else (lock.parent / candidate).resolve()
+    source_hash = (
+        file_sha256(source_spec)
+        if source_spec is not None and source_spec.is_file()
+        else str(exact_lock.get("source_environment_spec_hash", "missing") if exact_lock else lock_hash)
+    )
+    if exact_lock is not None and source_hash != str(exact_lock.get("source_environment_spec_hash")):
+        mismatches.append("source environment specification hash does not match exact lock")
     runtime_identity = {
         "schema_version": ENVIRONMENT_REPORT_SCHEMA_VERSION,
+        "source_environment_spec_hash": source_hash,
+        "exact_environment_lock_hash": lock_hash if exact_lock is not None else "missing",
         "python_version": platform.python_version(),
         "packages": packages,
         "os": platform.platform(),
-        "environment_lock_hash": lock_hash,
         "cuda_available": bool(torch.cuda.is_available()),
         "torch_cuda_build": torch.version.cuda,
         "cudnn_version": torch.backends.cudnn.version(),
@@ -205,7 +273,10 @@ def inspect_environment(lock_path: str | Path) -> dict[str, Any]:
         "git_dirty": bool(
             subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip()
         ),
+        "source_environment_spec_path": str(source_spec or (lock if exact_lock is None else "")),
         "environment_lock_path": str(lock),
+        "environment_lock_hash": lock_hash,
+        "exact_environment_lock": exact_lock is not None,
         "lock_expected_versions": expected,
         "lock_expected_builds": builds,
         "lock_unparsed_entries": unparsed,
@@ -215,18 +286,28 @@ def inspect_environment(lock_path: str | Path) -> dict[str, Any]:
         "torch_home": os.environ.get("TORCH_HOME", ""),
         "environment_runtime_hash": canonical_json_hash(runtime_identity),
     }
+    report["environment_report_hash"] = canonical_json_hash(_report_without_hash(report))
+    validate_environment_report(report)
     return report
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lock", required=True, help="Exact requirements lock or conda environment definition")
+    parser.add_argument("--source-spec")
     parser.add_argument("--out")
+    parser.add_argument("--require-cuda-exact", action="store_true")
     args = parser.parse_args()
-    report = inspect_environment(args.lock)
+    report = inspect_environment(args.lock, source_spec_path=args.source_spec)
     if args.out:
         atomic_write_json(report, args.out)
     print(json.dumps(report, indent=2, sort_keys=True))
+    if args.require_cuda_exact and not (
+        report.get("exact_environment_lock")
+        and report.get("lock_matches_runtime")
+        and report.get("cuda_available")
+    ):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
