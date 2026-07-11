@@ -1,4 +1,4 @@
-name: image-transfer-ci
+name: experiment-ci
 
 permissions:
   contents: read
@@ -10,9 +10,45 @@ on:
   workflow_dispatch:
 
 jobs:
-  cpu-tests:
+  gmm-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: gmm_simulation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: gmm_simulation/requirements.txt
+      - name: Install CPU dependencies
+        run: |
+          python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu torch==2.7.1+cpu torchvision==0.22.1+cpu
+          python -m pip install -r requirements.txt
+      - name: Verify moved-file hashes
+        run: sha256sum -c SHA256SUMS
+      - name: Compile
+        run: python -m compileall -q .
+      - name: Gaussian smoke regression
+        run: |
+          python train.py \
+            --experiment smoke \
+            --results-dir "${RUNNER_TEMP}/gaussian_smoke" \
+            --device cpu \
+            --training-steps 1 \
+            --n-generated 4 \
+            --score-risk-mc-samples 4 \
+            --seeds 0 \
+            --force
+
+  image-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: image_experiment
     env:
       PYTHONPATH: .
       HF_HUB_OFFLINE: "1"
@@ -23,6 +59,7 @@ jobs:
         with:
           python-version: "3.12.13"
           cache: pip
+          cache-dependency-path: image_experiment/environment/requirements-image-lock.txt
       - name: Configure temporary paths
         run: |
           echo "TORCH_HOME=$RUNNER_TEMP/empty-torch-cache" >> "$GITHUB_ENV"
@@ -34,36 +71,26 @@ jobs:
         run: python -m compileall -q image_transfer tests
       - name: Unit and integration tests
         run: python -m pytest -q
-      - name: Validate smoke job grid
+      - name: Validate FakeData job and preflight
         run: |
           python -m image_transfer.scripts.make_job_grid \
             --experiment A \
             --config image_transfer/configs/cifar10_fake_smoke.yaml \
             --out "${RUNNER_TEMP}/smoke_jobs.csv" \
             --max-jobs 20
-      - name: Validate resolved model and preflight
-        run: |
-          python -m image_transfer.scripts.inspect_model \
-            --config image_transfer/configs/cifar10_fake_smoke.yaml \
-            --out "${RUNNER_TEMP}/model_audit.json"
+          python -m image_transfer.scripts.run_job \
+            --jobs-csv "${RUNNER_TEMP}/smoke_jobs.csv" \
+            --job-index 0 \
+            --device cpu \
+            --force
           python -m image_transfer.scripts.preflight_experiment \
             --config image_transfer/configs/cifar10_fake_smoke.yaml \
             --out-dir "${RUNNER_TEMP}/preflight"
-      - name: Validate release grid shape without data access
+      - name: Validate unresolved release grid shape
         run: |
           python -m image_transfer.scripts.make_job_grid \
             --experiment A \
             --config image_transfer/configs/imagenet64_release_pilot.yaml \
             --out "${RUNNER_TEMP}/release_jobs.csv" \
             --max-jobs 20
-      - name: Gaussian regression
-        run: |
-          python train.py \
-            --experiment smoke \
-            --results-dir "${RUNNER_TEMP}/gaussian_smoke" \
-            --device cpu \
-            --training-steps 1 \
-            --n-generated 4 \
-            --score-risk-mc-samples 4 \
-            --seeds 0 \
-            --force
+          python -c "import csv; rows=list(csv.DictReader(open('${RUNNER_TEMP}/release_jobs.csv'))); assert len(rows)==12; assert {row['runnable'] for row in rows}=={'False'}; assert {row['dataset_identity_status'] for row in rows}=={'unresolved_strict'}; assert {row['exact_environment_lock_status'] for row in rows}=={'unresolved_strict'}"
