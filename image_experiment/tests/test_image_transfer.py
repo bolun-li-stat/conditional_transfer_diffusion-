@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 
 FAKE_CONFIG = "image_transfer/configs/cifar10_fake_smoke.yaml"
 
@@ -229,6 +231,7 @@ def test_offline_cpu_pipeline_to_atomic_results_aggregation_and_plots(tmp_path: 
         ],
         env=env,
     )
+
     run_cmd(
         [
             sys.executable,
@@ -259,3 +262,133 @@ def test_offline_cpu_pipeline_to_atomic_results_aggregation_and_plots(tmp_path: 
     assert "conditional_target_only_n0" in paired_text
     assert "unconditional_n0" in paired_text
     assert list((results / "figures").glob("*.png"))
+
+
+def test_v2_unequal_holdout_and_subset_seeds_run_grid_to_result(tmp_path: Path):
+    """Regress the v2 seed bug through grid, builder, training, and result IO."""
+
+    results_root = tmp_path / "unequal-seed-results"
+    raw = yaml.safe_load(Path(FAKE_CONFIG).read_text(encoding="utf-8"))
+    raw["output_root"] = str(results_root)
+    raw["data_split"]["manifest_root"] = str(results_root / "manifests")
+    raw["data_split"]["holdout_seed"] = 100
+    raw["data_split"].pop("training_subset_seed", None)
+    raw["seed_design"]["holdout_seed"] = 100
+    raw["seed_design"]["training_subset_seeds"] = [0, 1]
+    raw["fake_data_size"] = 64
+    raw["data_split"]["target_eval_size"] = 4
+    raw["data_split"]["target_val_size"] = 2
+    raw["n0_values"] = [4]
+    raw["experiments"]["A"]["n0_values"] = [4]
+    raw["training"]["steps"] = 1
+    raw["sampling"]["sampler"] = "ddim"
+    raw["sampling"]["steps"] = 2
+    raw["sampling"]["batch_size"] = 1
+    raw["num_generated"] = 1
+    raw["evaluation"]["real_eval_max"] = 4
+    raw["evaluation"]["train_diagnostic_max_images"] = 4
+    config_path = tmp_path / "unequal-seed-fake.yaml"
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    jobs_path = tmp_path / "unequal-seed-jobs.csv"
+    env = {
+        "RESULTS_ROOT": str(results_root),
+        "MPLCONFIGDIR": str(tmp_path / "matplotlib-unequal-seed"),
+    }
+    run_cmd(
+        [
+            sys.executable,
+            "-m",
+            "image_transfer.scripts.make_job_grid",
+            "--experiment",
+            "A",
+            "--config",
+            str(config_path),
+            "--out",
+            str(jobs_path),
+        ],
+        env=env,
+    )
+    with jobs_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert len(rows) == 6
+    assert {row["data_split_seed"] for row in rows} == {""}
+    assert {int(row["holdout_seed"]) for row in rows} == {100}
+    assert {int(row["training_subset_seed"]) for row in rows} == {0, 1}
+
+    selected_indices = [
+        index
+        for index, row in enumerate(rows)
+        if row["model_type"] in {"conditional_target_only_n0", "conditional_close"}
+    ]
+    assert len(selected_indices) == 4
+    for index in selected_indices:
+        run_cmd(
+            [
+                sys.executable,
+                "-m",
+                "image_transfer.scripts.run_job",
+                "--jobs-csv",
+                str(jobs_path),
+                "--job-index",
+                str(index),
+                "--device",
+                "cpu",
+                "--force",
+            ],
+            env=env,
+        )
+
+    records = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((results_root / "run_results").glob("*.json"))
+    ]
+    assert len(records) == 4
+    assert all(record["status"] == "completed" for record in records)
+    assert all(record["training"]["optimizer_steps"] == 1 for record in records)
+    assert all(Path(record["metadata"]["last_checkpoint_path"]).is_file() for record in records)
+    assert {record["metadata"]["holdout_seed"] for record in records} == {100}
+    assert {record["metadata"]["training_subset_seed"] for record in records} == {0, 1}
+    assert {record["job"]["data_split_seed"] for record in records} == {""}
+    assert len({record["metadata"]["split_manifest_hash"] for record in records}) == 1
+    assert len({record["metadata"]["target_eval_indices_hash"] for record in records}) == 1
+    assert len(
+        {record["metadata"]["target_validation_indices_hash"] for record in records}
+    ) == 1
+    assert len(
+        {record["metadata"]["target_similarity_reference_hash"] for record in records}
+    ) == 1
+
+    by_subset: dict[int, list[dict]] = {0: [], 1: []}
+    target_indices: dict[int, tuple[int, ...]] = {}
+    for record in records:
+        subset_seed = int(record["metadata"]["training_subset_seed"])
+        by_subset[subset_seed].append(record)
+        subset_manifest = json.loads(
+            Path(record["metadata"]["subset_manifest_path"]).read_text(encoding="utf-8")
+        )
+        n0 = int(record["job"]["n0"])
+        indices = tuple(str(value) for value in subset_manifest["target_training_order"][:n0])
+        if subset_seed in target_indices:
+            assert target_indices[subset_seed] == indices
+        target_indices[subset_seed] = indices
+
+    for paired_records in by_subset.values():
+        assert len(paired_records) == 2
+        assert {record["job"]["model_type"] for record in paired_records} == {
+            "conditional_target_only_n0",
+            "conditional_close",
+        }
+        assert len(
+            {record["metadata"]["subset_manifest_hash"] for record in paired_records}
+        ) == 1
+        assert len(
+            {record["metadata"]["target_training_subset_hash"] for record in paired_records}
+        ) == 1
+
+    assert target_indices[0] != target_indices[1]
+    assert len({record["metadata"]["subset_manifest_hash"] for record in records}) == 2
+    assert len(
+        {record["metadata"]["target_training_subset_hash"] for record in records}
+    ) == 2

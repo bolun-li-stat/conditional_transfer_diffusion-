@@ -38,6 +38,10 @@ jobs:
         run: python -m compileall -q image_transfer tests
       - name: Unit and integration tests
         run: python -m pytest -q
+      - name: V2 unequal-seed integration regression
+        run: >-
+          python -m pytest -q
+          tests/test_image_transfer.py::test_v2_unequal_holdout_and_subset_seeds_run_grid_to_result
       - name: Validate FakeData job and preflight
         run: |
           python -m image_transfer.scripts.make_job_grid \
