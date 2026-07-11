@@ -1,8 +1,43 @@
 # Image-transfer diffusion experiments
 
-This module is a publication-oriented framework for studying positive and negative transfer in class-conditional image diffusion models. It is isolated from, and does not change, the Gaussian-mixture simulation pipeline in the repository.
+Design and operational details are split into [STUDY_DESIGN.md](STUDY_DESIGN.md), [EXPERIMENT_READINESS.md](EXPERIMENT_READINESS.md), [ENVIRONMENT.md](ENVIRONMENT.md), [TARGET_SET_GUIDE.md](TARGET_SET_GUIDE.md), and [MIGRATION_PR12_TO_MAIN.md](MIGRATION_PR12_TO_MAIN.md).
+
+This module is a research-oriented framework for studying positive and negative transfer in class-conditional image diffusion models. It is isolated from, and does not change, the Gaussian-mixture simulation pipeline in the repository.
 
 No real ImageNet experiment results are included or claimed here. The supplied ImageNet files are configuration templates; running a full grid requires separately provided data, reviewed class groups, GPU compute, and an analysis of the resulting per-run records.
+
+## Model architecture
+
+New image experiments use a pixel-space, epsilon-predicting `adm_unet`. A convolutional U-Net is a natural fit for dense 32×32/64×64 noise prediction, follows the DDPM/ADM literature, and is substantially more practical than a DiT for repeated low-data grids. The reverse variance remains fixed: this change is architectural and does not alter the diffusion objective.
+
+The ADM-style model has two residual blocks per resolution in the main profile, GroupNorm/SiLU, sinusoidal time embeddings, class embeddings, adaptive GroupNorm scale/shift conditioning, multi-head self-attention, residual up/downsampling, dropout, and zero-initialized residual and output projections. Upsampling uses nearest-neighbor resize followed by convolution; downsampling uses residual stride convolutions. Decoder skip shapes are exact by construction—interpolation is never used to repair a mismatch. `legacy_simple_unet` remains available for historical YAML/checkpoint reproduction, with a deprecation warning when an old YAML omits `model.architecture`.
+
+| Profile | Base channels | ResBlocks/level | Attention | Dropout | Parameters (unconditional) | Intended use |
+|---|---:|---:|---|---:|---:|---|
+| `smoke_tiny` | 16 | 1 | none at encoder/decoder resolutions | 0.0 | 219,219 | CPU tests/FakeData plumbing only |
+| `pilot_small` | 40 | 2 | 16×16 | 0.1 | 10,549,043 | ImageNet64 pipeline and hyperparameter pilot |
+| `main_default` | 64 | 2 | 16×16, 8×8 | 0.1 | 28,289,923 | all primary study conditions |
+| `capacity_large` | 96 | 2 | 16×16, 8×8 | 0.1 | 63,604,035 | limited capacity sensitivity only |
+
+`main_default` is fixed across every `n0`, target, auxiliary composition, seed, and target-only/conditional comparison. Model capacity is never selected from the sample size or semantic distance. The small `imagenet64_capacity_sensitivity.yaml` design treats profile as an explicit factor for only `n0 ∈ {50,100}`, target-only/close/far, and three seeds.
+
+Conditional and unconditional models construct all shared modules before initializing the class embedding under a separate RNG stream. Thus every common name-and-shape backbone tensor is exactly equal at a shared initialization seed. The one-label conditional model is the primary architecture-matched control; the unconditional model remains a secondary scientific comparison.
+
+No pretrained diffusion model, VAE, encoder, latent diffusion, DiT, classifier guidance, or classifier-free guidance is used. Class dropout is fixed at zero and sampling guidance scale is implicitly one. This ensures that any cross-class sharing is learned only from the experiment's auxiliary data. Pretrained networks used strictly for post-training metrics do not initialize or guide the diffusion model.
+
+With only 50–500 independent target images, excess capacity primarily raises overfitting and memorization risk rather than classical underfitting risk. Diagnose this using the train/validation denoising gap together with generated-to-target-train versus generated-to-holdout nearest-neighbor summaries; do not use a parameters-per-image ratio to select architecture automatically.
+
+The checked-in engineering pilot uses French bulldog as its sole target. The main target-set template is intentionally empty, unreviewed, and unfrozen; choosing at least four targets across multiple supercategories is a researcher decision. Appropriate reporting language after a completed study is: “Results are observed under a standard ADM-style U-Net and are tested for limited capacity sensitivity.” The architecture does not directly identify the theoretical shared-specific decomposition.
+
+Inspect any resolved model without training:
+
+```bash
+python -m image_transfer.scripts.inspect_model \
+  --config image_transfer/configs/imagenet64_release_pilot.yaml \
+  --out model_audit.json
+```
+
+The implementation is original repository code informed by the architectural design in *Diffusion Models Beat GANs on Image Synthesis* (Dhariwal and Nichol, 2021) and *Improved Denoising Diffusion Probabilistic Models* (Nichol and Dhariwal, 2021); it does not copy the OpenAI `guided-diffusion` source.
 
 ## Research question
 
@@ -29,7 +64,7 @@ N_total = n0 + N_aux
 All paired models use the same `n0` target images.
 
 - `conditional_close`, `conditional_medium`, `conditional_far`, and `conditional_mix` use `n0` target images plus `m_per_aux` images from each of `K_aux` auxiliary classes.
-- Primary baseline: `conditional_target_only_n0`, a one-label conditional `ImageUNet` trained on only the same `n0` target images. Every input label is zero.
+- Primary baseline: `conditional_target_only_n0`, a one-label conditional ADM U-Net trained on only the same `n0` target images. Every input label is zero.
 - Legacy baseline: `unconditional_n0`, trained on only the same `n0` target images.
 
 This is the main target-scarce transfer comparison. A positive transfer gap means that adding auxiliary classes improves the target metric relative to the relevant target-only baseline.
@@ -41,7 +76,7 @@ Each auxiliary conditional model uses `n0` target images and `K_aux * m_per_aux`
 - Primary baseline: `conditional_target_only_equal_total`, the same conditional architecture with one label and `N_total` target images.
 - Legacy baseline: `unconditional_equal_total`, an unconditional model with `N_total` target images.
 
-The target evaluation set remains fixed across all models. Feasibility is checked only after the manifest has reserved target validation and evaluation images. If fewer than `N_total` target training candidates remain, paper runs fail or are explicitly recorded as skipped according to `data_split.insufficient_data_action`; the code does not shrink or replace the holdout set.
+The target evaluation set remains fixed across all models. Feasibility is checked only after the manifest has reserved target validation and evaluation images. If fewer than `N_total` target training candidates remain, strict runs fail or are explicitly recorded as skipped according to `data_split.insufficient_data_action`; the code does not shrink or replace the holdout set.
 
 ### Experiment C: auxiliary similarity and composition
 
@@ -81,11 +116,12 @@ loss = target_loss + auxiliary_loss_weight * auxiliary_loss
 
 This protocol controls target exposure but gives the conditional model additional examples and therefore additional compute. It must not be described as compute-matched. Report the two protocols separately.
 
-## Five independent random seeds and paired randomness
+## Six independent random streams and paired randomness
 
-Jobs split randomness into five recorded streams:
+Jobs split randomness into six recorded streams:
 
-- `data_split_seed`: manifest partitions and nested subset ordering;
+- `holdout_seed`: fixed validation/evaluation partitions;
+- `training_subset_seed`: nested target and auxiliary training orders;
 - `model_initialization_seed`: model weights;
 - `training_seed`: data order, training timesteps, and training noise;
 - `sampling_seed`: initial and reverse-process sampling noise;
@@ -95,13 +131,13 @@ Within a paired comparison, models use the same target manifest, sampling seed, 
 
 Conditional and unconditional construction also preserves matched initialization for all common, same-shaped backbone parameters at a shared model-initialization seed. The class embedding is initialized separately.
 
-The real CIFAR pilot has three paired repetitions. Publication experiments should use at least five paired seeds; the ImageNet publication template provides ten as the recommended final design.
+The real CIFAR pilot has three paired optimization repetitions. The ImageNet main template provides five training-subset repetitions with paired initialization/training, sampling, and evaluation streams. Auxiliary-class draw randomness is recorded separately as a sensitivity factor and is not treated as an independent target repetition.
 
 ## Fixed data manifests and leakage prevention
 
-Before any model-specific training subset is built, the data layer creates a schema-versioned JSON manifest identified by the dataset, target, experiment family, and `data_split_seed`. It records:
+Manifest schema v2 separates immutable holdouts from variable training subsets. Before any model-specific training subset is built, the data layer creates a split manifest keyed by dataset, target, split sizes, evaluation source, and `holdout_seed`, plus a subset manifest keyed by the split hash and `training_subset_seed`. Together they record:
 
-- a dataset fingerprint and manifest SHA256;
+- a dataset fingerprint and separate split/subset SHA256 identities;
 - target evaluation and validation references;
 - an ordered target training candidate pool;
 - train/evaluation candidate pools for every frozen auxiliary class;
@@ -109,9 +145,9 @@ Before any model-specific training subset is built, the data layer creates a sch
 
 For `eval_source: train_holdout`, target evaluation images are reserved first, target validation images second, and only the remainder becomes eligible for training. For an official test source, evaluation and validation are disjoint subsets of that source and training remains in the official training split. Target train, validation, and evaluation references never overlap.
 
-The shuffled target candidate order is fixed by the split seed. Consequently, when `nested_training_subsets: true`, the `n0=50` subset is a prefix of `n0=100`, which is a prefix of `n0=250`, and so on. For a fixed target, experiment family, and split seed, changing `model_type`, `aux_set`, training protocol, or `n0` does not change the target validation or evaluation set. Experiment A models use exactly the same `n0` target references.
+The shuffled target candidate order is fixed by the training-subset seed. Consequently, when `nested_training_subsets: true`, the `n0=50` subset is a prefix of `n0=100`, which is a prefix of `n0=250`, and so on. For a fixed target and holdout seed, changing experiment family, model type, auxiliary set, training protocol, `n0`, or training-subset seed does not change validation or evaluation references. Experiment A models with the same subset identity use exactly the same `n0` target references.
 
-In paper mode, an undersized requested holdout raises a clear error or produces an explicit skip record. It never silently reduces the holdout or chooses replacement reference images. Real-feature caches include the manifest hash, feature extractor identity, preprocessing, image size, and metric schema, so incompatible reference features cannot be reused.
+In strict mode, an undersized requested holdout raises a clear error or produces an explicit skip record. It never silently reduces the holdout or chooses replacement reference images. Real-feature caches include the manifest hash, feature extractor identity, preprocessing, image size, and metric schema, so incompatible reference features cannot be reused.
 
 Training images used for nearest-neighbor checks are read through deterministic evaluation transforms while retaining the exact manifest training indices; stochastic training augmentation is not used for memorization comparisons.
 
@@ -120,7 +156,7 @@ Training images used for nearest-neighbor checks are read through deterministic 
 Denoising evaluation uses persisted corruption banks rather than drawing fresh timesteps and noise for each model. A bank is keyed by the manifest hash, evaluation seed, diffusion horizon, corruptions per image, noise-bin definition, and schema version. Paired models therefore see the same images, timesteps, and epsilon noise.
 
 - The validation bank is used for checkpoint selection.
-- The final test/evaluation bank is used only for final evaluation and never selects a checkpoint. Paper transfer summaries and denoising plots use these `test_epsilon_mse_*` fields; validation fields remain checkpoint-selection diagnostics.
+- The final test/evaluation bank is used only for final evaluation and never selects a checkpoint. Main transfer summaries and denoising plots use these `test_epsilon_mse_*` fields; validation fields remain checkpoint-selection diagnostics.
 - Overall epsilon MSE follows the declared uniform-timestep distribution; it is not an unweighted average of unequal-width low/mid/high bins.
 - MSE is averaged over image dimensions, then aggregated by image to obtain an image-clustered standard error.
 - Low-, mid-, and high-noise results are reported separately.
@@ -129,7 +165,7 @@ Key fields include `validation_epsilon_mse_target`, `test_epsilon_mse_target`, t
 
 ## Generation metrics
 
-No single metric is treated as sufficient. Paper tables should report complementary quality, diversity, semantic, and memorization diagnostics.
+No single metric is treated as sufficient. Main tables should report complementary quality, diversity, semantic, and memorization diagnostics.
 
 | Metric | Interpretation and implementation rule |
 |---|---|
@@ -143,14 +179,14 @@ No single metric is treated as sufficient. Paper tables should report complement
 
 The metric metadata records backend and package versions, feature extractor and dimensionality, input range, resize/interpolation/antialias behavior, manifest/cache keys, and real/generated sample counts.
 
-### Paper mode and debug mode
+### Strict mode and debug mode
 
 Set `evaluation.mode` explicitly:
 
-- `paper`: a missing or failed FID/KID/feature backend raises an error. There is no mathematical fallback under the FID or KID field names.
+- `strict`: a missing or failed FID/KID/feature backend raises an error. There is no mathematical fallback under the FID or KID field names.
 - `debug`: a fast pooled-pixel diagnostic may be emitted as `debug_pooled_pixel_distance`. It is never written to `fid_target` or `kid_target_mean`.
 
-Before training begins, paper mode initializes the configured Inception, exact-mapping classifier, and diagnostic feature backends. Missing weights or mappings therefore fail before an expensive model fit. A custom complete ImageNet mapping can be supplied with `evaluation.classifier_synset_mapping_path`; unknown target or auxiliary synsets are errors in strict paper mode.
+Before training begins, strict mode initializes the configured Inception, exact-mapping classifier, and diagnostic feature backends. Missing weights or mappings therefore fail before an expensive model fit. A custom complete ImageNet mapping can be supplied with `evaluation.classifier_synset_mapping_path`; unknown target or auxiliary synsets are errors in strict mode.
 
 The real CIFAR pilot deliberately disables classifier fidelity because the repository does not bundle a version-pinned CIFAR-10 classifier. It never substitutes an ImageNet classifier. ImageNet classifier metadata includes architecture, weights, preprocessing, and exact mapping status.
 
@@ -183,7 +219,7 @@ Each run writes canonical `<run_id>_last.pt` and `<run_id>_best.pt` checkpoints.
 
 Checkpoints separately contain raw model state, EMA state, optimizer state, GradScaler state, current step, best validation metric, Python/NumPy/torch CPU/torch CUDA RNG states, config hash, manifest hash, git SHA, training protocol metadata, and resumable data-loader state. Resume restores raw and EMA models independently together with optimizer, scaler, RNG, and data progress; it does not load EMA weights into the raw model while retaining stale raw-model optimizer moments.
 
-The test suite verifies bitwise-equivalent resume in deterministic CPU mode with `num_workers: 0`. The checked-in reproducible pilot/publication templates use `num_workers: 0` for this reason. CUDA kernels can still be nondeterministic even though all required checkpoint state is restored; record such settings and do not claim bitwise identity unless it has been verified on the exact platform.
+The test suite verifies bitwise-equivalent resume in deterministic CPU mode with `num_workers: 0`. The checked-in reproducible pilot/main templates use `num_workers: 0` for this reason. CUDA kernels can still be nondeterministic even though all required checkpoint state is restored; record such settings and do not claim bitwise identity unless it has been verified on the exact platform.
 
 Use `--resume` on a job worker:
 
@@ -199,12 +235,13 @@ A checkpoint alone does not mark a run complete. A worker skips only when its sc
 
 ## Concurrent-safe outputs
 
-SLURM workers never append to a shared metrics CSV. Each worker atomically writes one result or failure record:
+Concurrent workers never append to a shared metrics CSV. Each worker atomically writes one result or failure record:
 
 ```text
 $RESULTS_ROOT/
   manifests/
-    <dataset>/*.manifest.json
+    <dataset>/<target>/*.split.json
+    <dataset>/<target>/<split-hash>/*.subset.json
   corruption_banks/
     *.json
   cache/
@@ -240,13 +277,18 @@ $RESULTS_ROOT/
   all_metrics.csv
   summary_metrics.csv
   paired_transfer_gaps.csv
+  subset_level_summaries.csv
+  target_level_summaries.csv
+  hierarchical_summaries.csv
   job_completeness.csv
   failed_jobs.csv
+  environment_summary.csv
+  readiness_summary.json
   similarity_correlations.csv
   figures/
 ```
 
-Failure JSON includes the exception type, message, traceback, config, job, git SHA, and timestamp. Run identifiers include the experiment, target, model type, auxiliary composition/draw, sample sizes, split/model/training seeds, protocol, sampler, sampling seed, evaluation seed, and config hash.
+Failure JSON includes the exception type, message, traceback, config, job, git SHA, and timestamp. Run identifiers include the experiment, target, model type, auxiliary composition/draw, sample sizes, split/subset/model/training seeds, protocol, sampler, sampling seed, evaluation seed, model/target/environment hashes, readiness outcome, and resolved config hash.
 
 Do not commit datasets, checkpoints, generated samples, feature caches, cluster logs, private paths, or credentials.
 
@@ -264,7 +306,7 @@ python -m image_transfer.scripts.plot_results \
   --experiment A
 ```
 
-`--expected-jobs` may be repeated for several grids. Aggregation validates result schemas, deduplicates by `run_id`, records invalid/missing/failed jobs, and writes the six CSV files shown above.
+`--expected-jobs` may be repeated for several grids. Aggregation validates result schemas, deduplicates by `run_id`, records invalid/missing/failed jobs, and writes run-level, subset-level, target-level, hierarchical, environment, readiness, and completeness outputs shown above. With one target, across-target hierarchical inference is explicitly unavailable.
 
 Primary pairing is:
 
@@ -281,202 +323,130 @@ lower-is-better: improvement = baseline metric - auxiliary-model metric
 higher-is-better: improvement = auxiliary-model metric - baseline metric
 ```
 
-Thus positive always means the auxiliary model improved. Candidate rows retain their own `m_per_aux` and `K_aux`, while baseline matching uses experiment, target, `n0`, the effective target-only training count, split/model/training/sampling/evaluation seeds, protocol, sampler, sampling steps, effective run-spec hash, and config hash. This is what permits an identical baseline to be reused across compatible auxiliary factorizations without changing the estimand. The aggregator computes differences within seeds, averages auxiliary-set draws within the seed cluster, and only then summarizes across independent seed clusters using the mean, sample standard deviation, standard error, 95% t confidence interval, completed pair count, and missing/failed pair count.
+Thus positive always means the auxiliary model improved. Candidate rows retain their own `m_per_aux` and `K_aux`, while baseline matching uses experiment, target, `n0`, the effective target-only training count, split/subset/model/config/target/environment identities, model/training/sampling/evaluation seeds, protocol, sampler, and sampling steps. The candidate-specific run identity remains available for audit but is intentionally not part of the baseline key. This permits an identical baseline to be reused across compatible auxiliary factorizations without changing the estimand. The aggregator computes differences within seeds, averages auxiliary-set draws within the seed cluster, and only then summarizes across independent seed clusters using the mean, sample standard deviation, standard error, 95% t confidence interval, completed pair count, and missing/failed pair count.
 
 Plots show paired improvement means with 95% intervals and a zero reference line. Raw paired points may be shown faintly, but raw values from different seeds are never sorted and connected into a false trajectory. Natural-compute-matched and target-exposure-matched runs remain distinct. Default figures cover transfer versus `n0`, auxiliary sample size, `K_aux`, and measured auxiliary similarity; final test-bank denoising by noise bin; semantic fidelity/leakage; density versus coverage; and fixed sample grids. Similarity analysis reports Spearman association and, where possible, a clustered bootstrap interval.
 
 ## Installation and tests
 
-Install an appropriate PyTorch build first, then the image dependencies:
+Create an exact environment; do not combine an arbitrary PyTorch wheel with an unlocked requirements file. The CPU lock is the locally exercised path:
 
 ```bash
-python -m pip install --upgrade pip
-python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-python -m pip install -r requirements-image.txt
-```
-
-The default test suite does not download pretrained weights or datasets:
-
-```bash
+python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+  -r environment/requirements-image-lock.txt
+python -m image_transfer.scripts.inspect_environment \
+  --lock environment/requirements-image-lock.txt \
+  --out readiness/environment_report.json
 python -m pytest -q
 ```
 
-## Offline CPU smoke test
+`environment/image-transfer-cuda.yml` is the intended GPU definition. It must be created and audited on the target cluster before use; its checked-in presence is not evidence of a successful GPU run. Tests and the CPU smoke path do not download datasets or pretrained weights.
 
-`cifar10_fake_smoke.yaml` uses `FakeData`, two training steps, tiny images, debug metrics, and no network downloads. Its outputs verify plumbing only and must never be reported as CIFAR-10 or scientific results.
+## Offline CPU smoke and dry run
+
+`cifar10_fake_smoke.yaml` uses `FakeData`, two training steps, tiny images, debug metrics, and no network. Its outputs validate plumbing only.
 
 ```bash
-export RESULTS_ROOT=$(mktemp -d /tmp/conditional_transfer_fake_smoke.XXXXXX)
-mkdir -p "$RESULTS_ROOT/A_equal_target/jobs"
-JOBS="$RESULTS_ROOT/A_equal_target/jobs/cifar10_fake_A.csv"
-
+export RESULTS_ROOT=$(mktemp -d /tmp/image_transfer_smoke.XXXXXX)
+JOBS="$RESULTS_ROOT/fake_A.csv"
 python -m image_transfer.scripts.make_job_grid \
   --experiment A \
   --config image_transfer/configs/cifar10_fake_smoke.yaml \
-  --out "$JOBS"
-
-N_JOBS=$(($(wc -l < "$JOBS") - 1))
-for JOB_INDEX in $(seq 0 $((N_JOBS - 1))); do
-  python -m image_transfer.scripts.run_job \
-    --jobs-csv "$JOBS" \
-    --job-index "$JOB_INDEX" \
-    --device cpu \
-    --force
-done
-
-python -m image_transfer.scripts.aggregate_results \
-  --results-root "$RESULTS_ROOT" \
-  --expected-jobs "$JOBS"
-python -m image_transfer.scripts.plot_results \
-  --results-root "$RESULTS_ROOT" \
-  --experiment A
+  --out "$JOBS" \
+  --max-jobs 20
+python -m image_transfer.scripts.run_job \
+  --jobs-csv "$JOBS" --job-index 0 --device cpu --dry-run
+python -m image_transfer.scripts.run_job \
+  --jobs-csv "$JOBS" --job-index 0 --device cpu --force
 ```
 
-## Real CIFAR-10 pilot
+## Real-data pilot workflow
 
-`cifar10_real_pilot.yaml` uses real CIFAR-10 (`use_fake_data: false`), dog and automobile targets, the official test source for fixed holdouts, three pilot seeds, and a deliberately small training template. It defaults to debug mode, disables FID/KID/classifier metrics, and labels any debug nearest-neighbor feature fallback explicitly; it is a pipeline and trend pilot, not a publication-scale result.
-
-```bash
-export DATA_ROOT=/path/to/cifar10
-export RESULTS_ROOT=/path/to/cifar10_pilot_results
-mkdir -p "$RESULTS_ROOT/A_equal_target/jobs"
-export JOBS="$RESULTS_ROOT/A_equal_target/jobs/cifar10_real_A.csv"
-
-python -m image_transfer.scripts.make_job_grid \
-  --experiment A \
-  --config image_transfer/configs/cifar10_real_pilot.yaml \
-  --out "$JOBS"
-
-# Inspect the grid before launching any jobs.
-python - <<'PY'
-import csv, os
-path = os.environ["JOBS"]
-with open(path, newline="", encoding="utf-8") as handle:
-    rows = list(csv.DictReader(handle))
-print("jobs:", len(rows))
-print("model types:", sorted({row["model_type"] for row in rows}))
-print("protocols:", sorted({row["training_protocol"] for row in rows}))
-PY
-```
-
-## ImageNet data and publication-grid template
-
-ImageNet is never downloaded automatically. Place or symlink ILSVRC2012 data as:
-
-```text
-$DATA_ROOT/
-  train/
-    n02108915/
-    ...
-  val/
-    n02108915/
-    ...
-```
-
-Missing required synset directories fail explicitly. Symlinked subset directories are supported and avoid unnecessary copies.
-
-The current pilot lists French bulldog and pre-existing close/medium/far groups only as a code template. A final paper must include multiple target classes. Researchers must audit, pre-register, and freeze every target and auxiliary candidate list before examining transfer results; do not choose targets, groups, or draws after seeing FID/KID.
-
-Generate—but do not launch—the publication template:
+ImageNet is never downloaded automatically. Provide an ILSVRC2012-style `train/<synset>/` and `val/<synset>/` tree, the exact CUDA environment, and offline metric assets. Then preflight the exact release configuration:
 
 ```bash
 export DATA_ROOT=/path/to/ILSVRC2012
-export RESULTS_ROOT=/path/to/image_transfer_results
-mkdir -p "$RESULTS_ROOT/A_equal_target/jobs"
-JOBS="$RESULTS_ROOT/A_equal_target/jobs/imagenet64_publication_A.csv"
+export RESULTS_ROOT=/path/to/image_transfer_release
+export TORCH_HOME=/path/to/offline_metric_assets
+export METRIC_ASSETS_MANIFEST="$TORCH_HOME/metric_assets_manifest.json"
 
+python -m image_transfer.scripts.prepare_metric_assets \
+  --asset-root "$TORCH_HOME" --manifest "$METRIC_ASSETS_MANIFEST" --offline-check
+python -m image_transfer.scripts.preflight_experiment \
+  --config image_transfer/configs/imagenet64_release_pilot.yaml \
+  --out-dir readiness
+```
+
+The release design is exactly 12 jobs: three model types (one-label target-only, close, far), two protocols, and two training-subset repetitions. The GPU micro-smoke is exactly three jobs. Grid creation prints the dimensional breakdown, estimated checkpoints and sample storage, and refuses more than `--max-jobs` unless `--allow-large-grid` is explicit.
+
+The checked-in French-bulldog target file is still marked unreviewed and unfrozen. It is suitable for this engineering pilot stage only and is not evidence of target-set review for a main analysis.
+
+```bash
+JOBS="$RESULTS_ROOT/imagenet64_release_A.csv"
 python -m image_transfer.scripts.make_job_grid \
   --experiment A \
-  --config image_transfer/configs/imagenet64_publication_template.yaml \
-  --out "$JOBS"
-
-echo "job rows: $(($(wc -l < "$JOBS") - 1))"
+  --config image_transfer/configs/imagenet64_release_pilot.yaml \
+  --out "$JOBS" \
+  --max-jobs 12
+python -m image_transfer.scripts.run_job \
+  --jobs-csv "$JOBS" --job-index 0 --device cuda --dry-run
 ```
 
-Generate B and C only after confirming manifest split sizes, equal-total feasibility, frozen class groups, storage requirements, and expected GPU cost. Grid creation does not train models or claim that an experiment has been completed.
-
-## Ginsburg workflow
-
-Scratch storage is not backed up. Keep repository, data, results, logs, and model caches separate.
+Workers can resume exact checkpoints without treating a checkpoint as a completed result:
 
 ```bash
-ssh bl3147@ginsburg.rcs.columbia.edu
-mkdir -p /burg/stats/users/bl3147/conditional_transfer_diffusion/{repo,data,results,logs,cache}
-cd /burg/stats/users/bl3147/conditional_transfer_diffusion/repo
-git clone https://github.com/bolun-li-stat/conditional_transfer_diffusion-.git .
-
-module load anaconda/3-2023.09
-conda create -n ctdiff_img python=3.11 -y
-conda activate ctdiff_img
-python -m pip install --upgrade pip
-python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-python -m pip install -r requirements-image.txt
+python -m image_transfer.scripts.run_job \
+  --jobs-csv "$JOBS" --job-index "${JOB_INDEX:?set a zero-based job index}" --device cuda --resume
 ```
 
-Verify an interactive GPU environment before submitting an array:
+After all rows finish, aggregate and validate completeness. Only the validator may replace the checked-in `not_run` status with a schema-v2 `passed` record containing matching grid/result evidence and provenance.
 
 ```bash
-srun --pty -t 0-01:00 --gres=gpu:1 -A stats /bin/bash
-python - <<'PY'
-import torch
-print("CUDA available:", torch.cuda.is_available())
-print("device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
-PY
+python -m image_transfer.scripts.aggregate_results \
+  --results-root "$RESULTS_ROOT" --expected-jobs "$JOBS"
+python -m image_transfer.scripts.plot_results \
+  --results-root "$RESULTS_ROOT" --experiment A
+python -m image_transfer.scripts.validate_release_pilot \
+  --config image_transfer/configs/imagenet64_release_pilot.yaml \
+  --jobs-csv "$JOBS" \
+  --results-root "$RESULTS_ROOT" \
+  --status-out readiness/pilot_status.json
 ```
 
-Generate and inspect the desired grid, then submit exactly its zero-based rows:
+## Sparse main and sensitivity grids
 
-```bash
-export PROJECT_ROOT=/burg/stats/users/bl3147/conditional_transfer_diffusion/repo
-export DATA_ROOT=/burg/stats/users/bl3147/conditional_transfer_diffusion/data
-export RESULTS_ROOT=/burg/stats/users/bl3147/conditional_transfer_diffusion/results
-export JOBS="$RESULTS_ROOT/A_equal_target/jobs/imagenet64_A_jobs.csv"
+The main template is blocked in three independent ways: its target-set file is empty/unreviewed/unfrozen, experiment A is disabled, and main-stage grid generation requires a matching passed release-pilot status via `readiness_pilot_config_path` and `readiness_status_path`. `--override-readiness-gate` is an auditable emergency override recorded in every job/result identity; it does not bypass target-set validation. Do not use it as normal workflow.
 
-cd "$PROJECT_ROOT"
-mkdir -p "$(dirname "$JOBS")"
-python -m image_transfer.scripts.make_job_grid \
-  --experiment A \
-  --config image_transfer/configs/imagenet64_publication_template.yaml \
-  --out "$JOBS"
+After researchers replace and freeze the target-set file, complete the pilot, and explicitly enable A in a reviewed config copy, the natural-protocol main design has 80 jobs per target: four `n0` values × four model types × five training-subset repetitions. The minimum four-target design therefore has 320 jobs, below the default 500-job guard. It uses `main_default`, 5,000 generated samples, and DDIM-250.
 
-LAST_INDEX=$(($(wc -l < "$JOBS") - 2))
-test "$LAST_INDEX" -ge 0
-sbatch --array=0-"$LAST_INDEX" \
-  scripts/ginsburg/run_image_transfer_array.sh \
-  "$JOBS"
-```
+Checked-in sensitivity files are disabled by default and require `--allow-disabled-experiment` after review:
 
-Monitor with:
+- `imagenet64_target_exposure_control.yaml`: `n0={50,100}`, one-label target-only/close/far, target-exposure matching only;
+- `imagenet64_auxiliary_size_sensitivity.yaml`: one target and `n0=100`, `K_aux=3`, ratios 0.5/1/2;
+- `imagenet64_fixed_budget_k_sensitivity.yaml`: a separate fixed-total-budget sweep over `K_aux={1,3,5}`;
+- `imagenet64_capacity_sensitivity.yaml`: one-label target-only/close/far, `n0={50,100}`, three profiles, and three training-subset repetitions.
 
-```bash
-squeue -u bl3147
-tail -f /burg/stats/users/bl3147/conditional_transfer_diffusion/logs/ctdiff_img_<job>_<task>.out
-```
+No sensitivity file enables an unconditional control or a large Cartesian product. The older `imagenet64_main_grid.yaml` path is a disabled compatibility template with the same target-freeze and readiness gates; it is not an alternate launch path.
 
-The publication template is intentionally large. Do not submit it without estimating row count, GPU-hours, disk usage, and metric-weight downloads. A smaller reviewed pilot grid should be completed first.
+For batch execution, activate the audited environment and export `PROJECT_ROOT`, `DATA_ROOT`, `RESULTS_ROOT`, `TORCH_HOME`, and `METRIC_ASSETS_MANIFEST`. Generate and inspect the CSV, then use the locally approved launcher with an exact zero-based job range. The checked-in launcher contains no account, hardware-model, environment-module, or storage-path selection; review its generic resource requests with the system operator before submission.
 
 ## Configuration migration
 
-Use the new explicit files for new runs:
+New YAMLs use only canonical keys. Compatibility aliases remain readable, but resolved configs and hashes use:
 
-- `cifar10_fake_smoke.yaml`: offline FakeData plumbing test; replaces the ambiguous fake `cifar10_sanity.yaml` name.
-- `cifar10_real_pilot.yaml`: real CIFAR-10 pilot with three seeds and two targets; replaces `cifar10_real_sanity.yaml` for new work.
-- `imagenet64_publication_template.yaml`: paper-mode template with explicit manifests, two protocols, five RNG streams, and ten recommended seeds.
-
-Older configuration keys remain useful for reading earlier runs, but migrate publication jobs as follows:
-
-| Legacy setting | Current setting |
+| Compatibility setting | Canonical setting |
 |---|---|
-| one overloaded `seed`/`seeds` | `data_split_seed`, `model_initialization_seeds`, `training_seeds`, `sampling_seeds`, `evaluation_seeds` |
-| implicit pooled training | `training_protocols` and `training.protocol` |
+| one overloaded split seed | separate `holdout_seed` and `training_subset_seed` |
+| parallel legacy seed lists | `seed_design` with six explicit random streams |
 | `evaluation.eval_split` | `data_split.eval_source` |
-| implicit/model-specific holdouts | `data_split.manifest_root`, fixed sizes, nested subsets, and insufficiency action |
+| `evaluation.corruptions_per_image` | validation/test/train-diagnostic counts |
 | `evaluation.compute_fid_kid` | separate `compute_fid` and `compute_kid` |
 | `evaluation.compute_classifier` | `compute_classifier_fidelity` |
-| top-level `sampling_steps` only | `sampling.sampler`, `sampling.steps`, `sampling.batch_size`, and `sampling.ddim_eta` |
+| top-level `sampling_steps` or `sampler` | the `sampling` section |
+| raw YAML identity | raw/resolved/model/study/target/environment hashes |
 | shared metrics CSV | atomic `run_results/<run_id>.json` followed by aggregation |
 
-Always set `evaluation.mode` explicitly. Do not combine outputs from old and new split/metric definitions unless their manifests, preprocessing, and schemas are demonstrably compatible.
+Always set `evaluation.mode` explicitly. Do not combine outputs across incompatible manifest schemas, target-set versions, model hashes, environment locks, samplers, or resolved configurations.
 
 ## Relationship to the shared-specific theory
 
@@ -496,4 +466,4 @@ This implementation does not:
 - provide ImageNet data, generated samples, checkpoints, caches, or experimental results;
 - invent additional ImageNet semantic groups without researcher review.
 
-Before a publication run, freeze multiple reviewed target classes, their auxiliary candidate pools, split sizes, protocols, metrics, seed plan, and planned exclusions. Preserve the generated job grids and manifests as part of the experimental provenance.
+Before a main run, freeze multiple reviewed target classes, their auxiliary candidate pools, split sizes, protocols, metrics, seed plan, and planned exclusions. Preserve the generated job grids and manifests as part of the experimental provenance.
