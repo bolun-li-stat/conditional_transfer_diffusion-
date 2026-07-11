@@ -1,0 +1,20 @@
+name: image-transfer-cuda
+channels: [pytorch, nvidia, conda-forge]
+dependencies:
+  - python=3.12.13
+  - pip
+  - pytorch=2.7.1
+  - torchvision=0.22.1
+  - pytorch-cuda=12.8
+  - pip:
+      - torchmetrics==1.9.0
+      - torch-fidelity==0.4.0
+      - numpy==2.5.1
+      - scipy==1.18.0
+      - pandas==3.0.3
+      - matplotlib==3.11.0
+      - Pillow==12.3.0
+      - PyYAML==6.0.3
+      - pytest==9.1.1
+      - scikit-learn==1.9.0
+      - tqdm==4.68.4
