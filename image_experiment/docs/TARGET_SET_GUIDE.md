@@ -14,10 +14,12 @@ Stage rules are deliberate:
 To prepare a main set:
 
 1. Copy the template to a versioned target-set filename.
-2. Add at least four predeclared targets across multiple supercategories.
+2. Add at least four predeclared targets across multiple supercategories; four to six is the intended broad/core range.
 3. For every target, document its selection rationale and audit all close/medium/far candidate synsets without looking at transfer outcomes.
 4. Have the designated researcher record the reviewer and review date, then set `reviewed: true` and `frozen: true`.
-5. Point a reviewed main config copy at that file and preserve the file with the generated grid and resolved configuration.
+5. Mark exactly one predeclared target as the primary target for the optimization and K-sensitivity configurations.
+6. Confirm before outcomes are viewed that the primary target has enough close/far candidates for the requested unique K draws; any smaller number of real combinations is recorded rather than duplicated.
+7. Point reviewed config copies at the frozen file and preserve it with every generated grid and resolved configuration.
 
 The resolver rejects missing metadata, duplicate targets, incomplete auxiliary groups, too few main targets without the explicit single-target exception, and single-supercategory multi-target main sets. Grid generation also requires a matching passed release-pilot status. An explicit readiness override is recorded but never bypasses target-set validation.
 

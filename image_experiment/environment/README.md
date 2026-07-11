@@ -7,11 +7,15 @@ For CPU setup, create a clean Python 3.12.13 environment and run:
 ```bash
 python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu \
   -r environment/requirements-image-lock.txt
+python -m image_transfer.scripts.freeze_environment \
+  --source-spec environment/requirements-image-lock.txt \
+  --out readiness/environment_exact_lock.json
 python -m image_transfer.scripts.inspect_environment \
-  --lock environment/requirements-image-lock.txt
+  --lock readiness/environment_exact_lock.json \
+  --source-spec environment/requirements-image-lock.txt \
+  --out readiness/environment_runtime_report.json
 ```
 
-Alternatively, from the repository root run `conda env create -f environment/image-transfer-cpu.yml`;
-the YAML supplies the CPU wheel index and the repository-relative exact lock path.
+Alternatively, from the `image_experiment` module root run `conda env create -f environment/image-transfer-cpu.yml`; the YAML supplies the CPU wheel index and the module-relative tested requirements path.
 
-For the intended GPU setup, create `environment/image-transfer-cuda.yml` on the target cluster, then audit that YAML directly with `inspect_environment`. Do not substitute the CPU lock when generating GPU grids. Every preflight and run records the selected definition's SHA256. Changing any version therefore changes the environment identity and prevents unmarked cross-environment pairing.
+For GPU setup, treat `environment/image-transfer-cuda.yml` as a source specification only. Activate the final target-cluster environment, generate an exact lock with `freeze_environment`, and pass that lock plus the source specification to `inspect_environment --require-cuda-exact`. Do not substitute the CPU lock when generating GPU grids. Every preflight and run records the source, exact-lock, and runtime hashes; changing any layer prevents unmarked cross-environment pairing.

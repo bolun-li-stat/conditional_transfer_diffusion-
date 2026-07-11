@@ -14,9 +14,9 @@ Target and auxiliary groups are researcher inputs, not outcomes selected by the 
 
 The target-set content, analysis plan, model configuration, resolved run configuration, and environment definition are hashed into provenance and pairing keys. Changing any of them changes run identity.
 
-## Six random streams and manifest v2
+## Random streams and manifest v2
 
-Each job records six separate random streams:
+Each job records separate random streams:
 
 1. `holdout_seed` fixes validation/evaluation partitions.
 2. `training_subset_seed` fixes nested target and auxiliary training orders.
@@ -25,9 +25,11 @@ Each job records six separate random streams:
 5. `sampling_seed` fixes initial and reverse-process sampling noise.
 6. `evaluation_seed` fixes persisted corruption banks.
 
-Auxiliary-set draw randomness is a recorded sensitivity factor, not an independent target repetition.
+7. `aux_draw_seed` and `aux_draw_id` fix the auxiliary-class combination.
 
-Manifest schema v2 separates a split manifest from a subset manifest. The split identity covers the dataset fingerprint, target and auxiliary evaluation pools, holdout seed, sizes, and evaluation source. The subset identity covers the split hash, training-subset seed, and nested candidate orders. Changing experiment family, model type, protocol, or training-subset seed cannot change a fixed holdout. Within one subset order, target `n0=50` is a prefix of 100, then 250, then 500. Target train/validation/evaluation references are disjoint, as are auxiliary train/evaluation references.
+Auxiliary draws and optimization, sampling, or evaluation repetitions are technical repetitions, not independent target-data repetitions.
+
+Manifest schema v2 separates a split manifest from a subset manifest. The split identity covers the frozen dataset content identity, target and auxiliary evaluation pools, dedicated target/auxiliary similarity references, holdout seed, sizes, and evaluation source. The subset identity covers the split hash, training-subset seed, and nested candidate orders. Changing experiment family, model type, protocol, or training-subset seed cannot change a fixed holdout. Within one subset order, target `n0=50` is a prefix of 100, then 250, then 500. Train, validation, final evaluation, and similarity references are mutually disjoint as applicable.
 
 Paired models share split/subset identities, model initialization, sampling noise, evaluation corruptions, sampler settings, target-set version, and environment lock. Aggregation rejects ambiguous or provenance-incompatible baseline matches.
 
@@ -44,14 +46,17 @@ Validation, test, and train-diagnostic corruption banks are distinct. Validation
 | Configuration | Design | Expected rows |
 |---|---|---:|
 | GPU micro-smoke | one target, `n0=100`, target-only/close/far, one natural repeat | 3 |
-| Release pilot | same three models, natural and target-exposure protocols, two training subsets | 12 |
-| Main template | four `n0` values, target-only/close/far/mix, natural protocol, five training subsets | 80 per target; 320 for the minimum four targets |
+| Release pilot | `K_aux=5`, same three models, natural and target-exposure protocols, two training subsets | 12 |
+| Main template | `K_aux=3`, four `n0` values, target-only/close/far/mix, natural protocol, five training subsets | 80 per target; 320 for the minimum four targets |
+| Core confirmatory | `K_aux=3`, `n0={50,100}`, target-only/close/far, both protocols, ten subsets | 120 per target; 480 for the minimum four targets |
+| Optimization stability | one primary target, `K_aux=3`, `n0={50,100}`, five subsets, two optimization repeats | 60 |
+| K sensitivity | one primary target, `K_aux={1,3,5}`, equal-per-class and fixed-total-300 labels, frozen unique draws | 165 |
 | Target-exposure control | `n0={50,100}`, target-only/close/far, three training subsets | 18 |
 | Auxiliary-size check | one target, `n0=100`, `K_aux=3`, ratios 0.5/1/2, close/far | 21 |
 | Fixed-budget K check | one target, `n0=100`, total auxiliary budget 300, `K_aux={1,3,5}`, close/far | 21 |
 | Capacity check | `n0={50,100}`, target-only/close/far, three profiles, three training subsets | 54 |
 
-The main and sensitivity experiments are disabled by default. The job-grid tool prints model/target/protocol/size/profile breakdowns, checkpoint and sample-storage estimates, and refuses oversized grids without an explicit override. The old main-grid filename is a compatibility template with the same target-freeze and readiness gates; it cannot launch an inline single-target substitute.
+The main and sensitivity experiments are disabled by default. The optimization, K, and capacity designs are main-stage configurations, so allowing a disabled experiment still leaves their reviewed/frozen target, dataset-identity, exact-environment, runtime-evidence, readiness, and job-count gates intact. The release pilot is the engineering run that supplies readiness evidence and cannot depend on its own output. The job-grid tool prints model/target/protocol/size/profile breakdowns, checkpoint and sample-storage estimates, and refuses oversized grids without an explicit override. The old main-grid filename is a compatibility template with the same target-freeze and readiness gates; it cannot launch an inline single-target substitute.
 
 ## Outcomes and diagnostics
 
@@ -59,12 +64,12 @@ Primary endpoints are final target test-bank epsilon MSE and target KID. KID is 
 
 Secondary outcomes include FID, precision/recall/density/coverage, exact-mapping classifier fidelity, auxiliary leakage, noise-bin MSE, train/validation/test gaps, and memorization diagnostics. Nearest-neighbor thresholds are calibrated from validation references only, then applied to test/generated comparisons. Generated-to-target-train, target-holdout, auxiliary-train, and auxiliary-holdout summaries remain separate.
 
-All gaps are improvement-positive: baseline minus model for lower-is-better metrics and model minus baseline for higher-is-better metrics. Auxiliary draws are averaged within a seed cluster; optimization repeats are summarized within a training subset; subsets are summarized within target; targets form the highest level. When only one target exists, across-target hierarchical inference is unavailable.
+All gaps are improvement-positive: baseline minus model for lower-is-better metrics and model minus baseline for higher-is-better metrics. Auxiliary, sampling, and evaluation repetitions are averaged first; optimization repeats are summarized within a training subset; subsets are summarized within target; targets form the highest level. Continuous auxiliary similarity is an explanatory covariate, never an exact hierarchy key. When only one target exists, across-target hierarchical inference is unavailable.
 
 Required aggregate artifacts include `all_metrics.csv`, `summary_metrics.csv`, `paired_transfer_gaps.csv`, `subset_level_summaries.csv`, `target_level_summaries.csv`, `hierarchical_summaries.csv`, `job_completeness.csv`, `failed_jobs.csv`, `environment_summary.csv`, and `readiness_summary.json`.
 
 ## Readiness boundary
 
-Real strict runs require the exact locked environment and offline-verified metric assets. The 12-job release pilot must complete and pass the schema-v2 validator before a main-stage grid is generated. A passed status certifies engineering health and exact grid/result evidence only. The status must match its release-pilot config, model, environment, target-set and git provenance; the main target set is separately validated rather than equated with the pilot target.
+Real strict runs require a frozen dataset identity, exact resolved environment lock, matching actual runtime report, GPU load and resume probes, and offline-verified metric assets. The 12-job release pilot must complete and pass the schema-3 validator before a main-stage grid is generated. A passed status certifies engineering health and exact grid/result evidence only. The status must match its release-pilot config, model, environment, target-set and git provenance; the main target set is separately validated rather than equated with the pilot target.
 
 The current checked-in status is `not_run`. No real ImageNet metric improvement, completed main grid, or general transfer conclusion is claimed.

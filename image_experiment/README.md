@@ -1,6 +1,6 @@
 # Image-transfer diffusion experiments
 
-Design and operational details are split into [STUDY_DESIGN.md](STUDY_DESIGN.md), [EXPERIMENT_READINESS.md](EXPERIMENT_READINESS.md), [ENVIRONMENT.md](ENVIRONMENT.md), [TARGET_SET_GUIDE.md](TARGET_SET_GUIDE.md), and [MIGRATION_PR12_TO_MAIN.md](MIGRATION_PR12_TO_MAIN.md).
+Design and operational details are split into [STUDY_DESIGN.md](docs/STUDY_DESIGN.md), [EXPERIMENT_READINESS.md](docs/EXPERIMENT_READINESS.md), [ENVIRONMENT.md](docs/ENVIRONMENT.md), [TARGET_SET_GUIDE.md](docs/TARGET_SET_GUIDE.md), and [MIGRATION_PR12_TO_MAIN.md](docs/MIGRATION_PR12_TO_MAIN.md).
 
 This module is a research-oriented framework for studying positive and negative transfer in class-conditional image diffusion models. It is isolated from, and does not change, the Gaussian-mixture simulation pipeline in the repository.
 
@@ -116,9 +116,9 @@ loss = target_loss + auxiliary_loss_weight * auxiliary_loss
 
 This protocol controls target exposure but gives the conditional model additional examples and therefore additional compute. It must not be described as compute-matched. Report the two protocols separately.
 
-## Six independent random streams and paired randomness
+## Recorded random streams and paired randomness
 
-Jobs split randomness into six recorded streams:
+Jobs record each source of randomness separately:
 
 - `holdout_seed`: fixed validation/evaluation partitions;
 - `training_subset_seed`: nested target and auxiliary training orders;
@@ -126,12 +126,13 @@ Jobs split randomness into six recorded streams:
 - `training_seed`: data order, training timesteps, and training noise;
 - `sampling_seed`: initial and reverse-process sampling noise;
 - `evaluation_seed`: fixed corruption banks.
+- `aux_draw_seed` plus `aux_draw_id`: frozen auxiliary-class combinations.
 
 Within a paired comparison, models use the same target manifest, sampling seed, number of generated images, sampling batch size, sampler, and sampling steps. This common-random-number design reduces paired Monte Carlo noise. Sampling uses its own explicit `torch.Generator`, so its output does not depend on how much randomness training consumed.
 
 Conditional and unconditional construction also preserves matched initialization for all common, same-shaped backbone parameters at a shared model-initialization seed. The class embedding is initialized separately.
 
-The real CIFAR pilot has three paired optimization repetitions. The ImageNet main template provides five training-subset repetitions with paired initialization/training, sampling, and evaluation streams. Auxiliary-class draw randomness is recorded separately as a sensitivity factor and is not treated as an independent target repetition.
+The release pilot uses two independent training subsets and one optimization repeat. The broad main design uses five subsets and one optimization repeat; the core design uses ten subsets; the optimization-stability design uses five subsets with two optimization repeats inside each subset. Sampling, evaluation, optimization, and auxiliary-draw repetitions are nested technical repetitions and never increase the number of independent training subsets.
 
 ## Fixed data manifests and leakage prevention
 
@@ -139,15 +140,17 @@ Manifest schema v2 separates immutable holdouts from variable training subsets. 
 
 - a dataset fingerprint and separate split/subset SHA256 identities;
 - target evaluation and validation references;
+- a target-only similarity reference split that is disjoint from train, validation, and final evaluation;
+- per-class auxiliary similarity references that are disjoint from auxiliary training and evaluation;
 - an ordered target training candidate pool;
 - train/evaluation candidate pools for every frozen auxiliary class;
 - requested and actual split sizes and explicit feasibility information.
 
-For `eval_source: train_holdout`, target evaluation images are reserved first, target validation images second, and only the remainder becomes eligible for training. For an official test source, evaluation and validation are disjoint subsets of that source and training remains in the official training split. Target train, validation, and evaluation references never overlap.
+For `eval_source: train_holdout`, target evaluation images are reserved first, target validation images second, and the dedicated similarity reference next; only the remainder becomes eligible for training. For an official test source, evaluation, validation, and similarity references are disjoint subsets of that source and training remains in the official training split. Target train, validation, similarity, and final evaluation references never overlap.
 
 The shuffled target candidate order is fixed by the training-subset seed. Consequently, when `nested_training_subsets: true`, the `n0=50` subset is a prefix of `n0=100`, which is a prefix of `n0=250`, and so on. For a fixed target and holdout seed, changing experiment family, model type, auxiliary set, training protocol, `n0`, or training-subset seed does not change validation or evaluation references. Experiment A models with the same subset identity use exactly the same `n0` target references.
 
-In strict mode, an undersized requested holdout raises a clear error or produces an explicit skip record. It never silently reduces the holdout or chooses replacement reference images. Real-feature caches include the manifest hash, feature extractor identity, preprocessing, image size, and metric schema, so incompatible reference features cannot be reused.
+In strict mode, an undersized requested reservation raises a clear error or produces an explicit skip record. It never silently reduces a split or chooses replacement reference images. A frozen content inventory binds every runnable grid row to the current dataset. Missing identity or exact environment evidence creates a shape-only row with `runnable=false`; changed content cannot reuse an old completed result. Real-feature caches include the manifest hash, feature extractor identity, preprocessing, image size, and metric schema, so incompatible reference features cannot be reused.
 
 Training images used for nearest-neighbor checks are read through deterministic evaluation transforms while retaining the exact manifest training indices; stochastic training augmentation is not used for memorization comparisons.
 
@@ -220,6 +223,8 @@ Each run writes canonical `<run_id>_last.pt` and `<run_id>_best.pt` checkpoints.
 Checkpoints separately contain raw model state, EMA state, optimizer state, GradScaler state, current step, best validation metric, Python/NumPy/torch CPU/torch CUDA RNG states, config hash, manifest hash, git SHA, training protocol metadata, and resumable data-loader state. Resume restores raw and EMA models independently together with optimizer, scaler, RNG, and data progress; it does not load EMA weights into the raw model while retaining stale raw-model optimizer moments.
 
 The test suite verifies bitwise-equivalent resume in deterministic CPU mode with `num_workers: 0`. The checked-in reproducible pilot/main templates use `num_workers: 0` for this reason. CUDA kernels can still be nondeterministic even though all required checkpoint state is restored; record such settings and do not claim bitwise identity unless it has been verified on the exact platform.
+
+The release evidence probe performs a real save, destroys the model/EMA/optimizer/scaler objects, rebuilds them, loads the checkpoint, and continues training. CPU mode requires exact equality; GPU mode verifies state continuity and finite values without claiming bitwise equality.
 
 Use `--resume` on a job worker:
 
@@ -323,7 +328,9 @@ lower-is-better: improvement = baseline metric - auxiliary-model metric
 higher-is-better: improvement = auxiliary-model metric - baseline metric
 ```
 
-Thus positive always means the auxiliary model improved. Candidate rows retain their own `m_per_aux` and `K_aux`, while baseline matching uses experiment, target, `n0`, the effective target-only training count, split/subset/model/config/target/environment identities, model/training/sampling/evaluation seeds, protocol, sampler, and sampling steps. The candidate-specific run identity remains available for audit but is intentionally not part of the baseline key. This permits an identical baseline to be reused across compatible auxiliary factorizations without changing the estimand. The aggregator computes differences within seeds, averages auxiliary-set draws within the seed cluster, and only then summarizes across independent seed clusters using the mean, sample standard deviation, standard error, 95% t confidence interval, completed pair count, and missing/failed pair count.
+Thus positive always means the auxiliary model improved. Candidate rows retain their own `m_per_aux` and `K_aux`, while baseline matching uses experiment, target, `n0`, the effective target-only training count, split/subset/model/config/target/environment identities, model/training/sampling/evaluation seeds, protocol, sampler, and sampling steps. The candidate-specific run identity remains available for audit but is intentionally not part of the baseline key. This permits an identical baseline to be reused across compatible auxiliary factorizations without changing the estimand.
+
+Nested summaries average auxiliary, sampling, and evaluation repetitions first; then optimization repeats within a training subset; then independent training subsets within a target; and only then targets in the across-target bootstrap. `average_auxiliary_similarity` is excluded from exact condition keys and is used only in continuous correlation/regression diagnostics. The reports expose target, subset, optimization, auxiliary-draw, sampling-repeat, completed-pair, and missing-pair counts so technical repetition cannot inflate the independent sample size.
 
 Plots show paired improvement means with 95% intervals and a zero reference line. Raw paired points may be shown faintly, but raw values from different seeds are never sorted and connected into a false trajectory. Natural-compute-matched and target-exposure-matched runs remain distinct. Default figures cover transfer versus `n0`, auxiliary sample size, `K_aux`, and measured auxiliary similarity; final test-bank denoising by noise bin; semantic fidelity/leakage; density versus coverage; and fixed sample grids. Similarity analysis reports Spearman association and, where possible, a clustered bootstrap interval.
 
@@ -334,13 +341,17 @@ Create an exact environment; do not combine an arbitrary PyTorch wheel with an u
 ```bash
 python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu \
   -r environment/requirements-image-lock.txt
+python -m image_transfer.scripts.freeze_environment \
+  --source-spec environment/requirements-image-lock.txt \
+  --out readiness/environment_exact_lock.json
 python -m image_transfer.scripts.inspect_environment \
-  --lock environment/requirements-image-lock.txt \
-  --out readiness/environment_report.json
+  --lock readiness/environment_exact_lock.json \
+  --source-spec environment/requirements-image-lock.txt \
+  --out readiness/environment_runtime_report.json
 python -m pytest -q
 ```
 
-`environment/image-transfer-cuda.yml` is the intended GPU definition. It must be created and audited on the target cluster before use; its checked-in presence is not evidence of a successful GPU run. Tests and the CPU smoke path do not download datasets or pretrained weights.
+`environment/image-transfer-cuda.yml` is only the intended GPU specification. On the target cluster, generate an exact package/build lock from the activated environment and then capture a separate runtime report. The checked-in YAML alone is not executable evidence. Tests and the CPU smoke path do not download datasets or pretrained weights.
 
 ## Offline CPU smoke and dry run
 
@@ -369,12 +380,38 @@ export DATA_ROOT=/path/to/ILSVRC2012
 export RESULTS_ROOT=/path/to/image_transfer_release
 export TORCH_HOME=/path/to/offline_metric_assets
 export METRIC_ASSETS_MANIFEST="$TORCH_HOME/metric_assets_manifest.json"
+export EXACT_ENVIRONMENT_LOCK_PATH="$RESULTS_ROOT/readiness/environment_exact_lock.json"
+export ENVIRONMENT_RUNTIME_REPORT_PATH="$RESULTS_ROOT/readiness/environment_runtime_report.json"
+export DATASET_IDENTITY_PATH="$RESULTS_ROOT/readiness/dataset_identity.json"
+export GPU_RUNTIME_PROBE_PATH="$RESULTS_ROOT/readiness/gpu_runtime_probe.json"
+export RESUME_PROBE_PATH="$RESULTS_ROOT/readiness/resume_probe.json"
 
+python -m image_transfer.scripts.freeze_environment \
+  --source-spec environment/image-transfer-cuda.yml \
+  --out "$EXACT_ENVIRONMENT_LOCK_PATH"
+python -m image_transfer.scripts.inspect_environment \
+  --lock "$EXACT_ENVIRONMENT_LOCK_PATH" \
+  --source-spec environment/image-transfer-cuda.yml \
+  --out "$ENVIRONMENT_RUNTIME_REPORT_PATH" \
+  --require-cuda-exact
+python -m image_transfer.scripts.freeze_dataset_identity \
+  --config image_transfer/configs/imagenet64_release_pilot.yaml \
+  --out "$DATASET_IDENTITY_PATH"
 python -m image_transfer.scripts.prepare_metric_assets \
   --asset-root "$TORCH_HOME" --manifest "$METRIC_ASSETS_MANIFEST" --offline-check
+python -m image_transfer.scripts.gpu_runtime_probe \
+  --config image_transfer/configs/imagenet64_release_pilot.yaml \
+  --environment-report "$ENVIRONMENT_RUNTIME_REPORT_PATH" \
+  --out "$GPU_RUNTIME_PROBE_PATH"
+python -m image_transfer.scripts.run_resume_probe \
+  --config image_transfer/configs/imagenet64_release_pilot.yaml \
+  --environment-report "$ENVIRONMENT_RUNTIME_REPORT_PATH" \
+  --work-dir "$RESULTS_ROOT/readiness/resume_probe_work" \
+  --out "$RESUME_PROBE_PATH" \
+  --require-cuda
 python -m image_transfer.scripts.preflight_experiment \
   --config image_transfer/configs/imagenet64_release_pilot.yaml \
-  --out-dir readiness
+  --out-dir "$RESULTS_ROOT/readiness/preflight"
 ```
 
 The release design is exactly 12 jobs: three model types (one-label target-only, close, far), two protocols, and two training-subset repetitions. The GPU micro-smoke is exactly three jobs. Grid creation prints the dimensional breakdown, estimated checkpoints and sample storage, and refuses more than `--max-jobs` unless `--allow-large-grid` is explicit.
@@ -399,7 +436,7 @@ python -m image_transfer.scripts.run_job \
   --jobs-csv "$JOBS" --job-index "${JOB_INDEX:?set a zero-based job index}" --device cuda --resume
 ```
 
-After all rows finish, aggregate and validate completeness. Only the validator may replace the checked-in `not_run` status with a schema-v2 `passed` record containing matching grid/result evidence and provenance.
+After all rows finish, aggregate and validate completeness. Only the validator may replace the checked-in `not_run` status with a schema-3 `passed` record containing matching grid, runtime, result, artifact, and provenance evidence.
 
 ```bash
 python -m image_transfer.scripts.aggregate_results \
@@ -417,7 +454,15 @@ python -m image_transfer.scripts.validate_release_pilot \
 
 The main template is blocked in three independent ways: its target-set file is empty/unreviewed/unfrozen, experiment A is disabled, and main-stage grid generation requires a matching passed release-pilot status via `readiness_pilot_config_path` and `readiness_status_path`. `--override-readiness-gate` is an auditable emergency override recorded in every job/result identity; it does not bypass target-set validation. Do not use it as normal workflow.
 
-After researchers replace and freeze the target-set file, complete the pilot, and explicitly enable A in a reviewed config copy, the natural-protocol main design has 80 jobs per target: four `n0` values × four model types × five training-subset repetitions. The minimum four-target design therefore has 320 jobs, below the default 500-job guard. It uses `main_default`, 5,000 generated samples, and DDIM-250.
+After researchers replace and freeze the target-set file, complete the pilot, and explicitly enable A in a reviewed config copy, the natural-protocol main design uses `K_aux=3` and has 80 jobs per target: four `n0` values × four model types × five training-subset repetitions. The minimum four-target design therefore has 320 jobs, below the default 500-job guard. It uses `main_default`, 5,000 generated samples, and DDIM-250. The release pilot keeps `K_aux=5` only as an engineering and strong-pooling stress condition.
+
+The staged confirmatory files are deliberately sparse:
+
+- `imagenet64_core_confirmatory.yaml`: `K_aux=3`, `n0={50,100}`, target-only/close/far, ten independent subsets, and both protocols; 120 jobs per target, or 480 for the minimum four-target set;
+- `imagenet64_optimization_stability.yaml`: one predeclared primary target, `K_aux=3`, `n0={50,100}`, five subsets with two optimization repeats inside each subset; 60 jobs;
+- `imagenet64_k_sensitivity.yaml`: one predeclared primary target, `n0=100`, close/far, five subsets, and `K_aux={1,3,5}` under separate `equal_per_class` and `fixed_total_300` labels; 165 jobs for the checked-in candidate pools.
+
+For K sensitivity, `K=1` and `K=3` use three frozen unique auxiliary draws. If a `K=5` bin has fewer than three unique combinations, every real combination is used once and no duplicate draw is invented. The equal-per-class design changes total auxiliary amount with K; the fixed-total design holds the total at 300 and rejects a nondivisible allocation.
 
 Checked-in sensitivity files are disabled by default and require `--allow-disabled-experiment` after review:
 
@@ -426,7 +471,7 @@ Checked-in sensitivity files are disabled by default and require `--allow-disabl
 - `imagenet64_fixed_budget_k_sensitivity.yaml`: a separate fixed-total-budget sweep over `K_aux={1,3,5}`;
 - `imagenet64_capacity_sensitivity.yaml`: one-label target-only/close/far, `n0={50,100}`, three profiles, and three training-subset repetitions.
 
-No sensitivity file enables an unconditional control or a large Cartesian product. The older `imagenet64_main_grid.yaml` path is a disabled compatibility template with the same target-freeze and readiness gates; it is not an alternate launch path.
+No sensitivity file enables an unconditional control or a large Cartesian product. The optimization, K, and capacity designs are main-stage configurations: allowing a disabled experiment does not bypass their reviewed/frozen target, dataset-identity, exact-environment, runtime-evidence, readiness, or job-count gates. The release pilot produces the evidence consumed by that readiness gate and therefore does not require its own output before it can run. The older `imagenet64_main_grid.yaml` path is a disabled compatibility template with the same target-freeze and readiness gates; it is not an alternate launch path.
 
 For batch execution, activate the audited environment and export `PROJECT_ROOT`, `DATA_ROOT`, `RESULTS_ROOT`, `TORCH_HOME`, and `METRIC_ASSETS_MANIFEST`. Generate and inspect the CSV, then use the locally approved launcher with an exact zero-based job range. The checked-in launcher contains no account, hardware-model, environment-module, or storage-path selection; review its generic resource requests with the system operator before submission.
 

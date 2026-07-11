@@ -1,14 +1,27 @@
 # Environment and offline assets
 
-Exact CPU and intended CUDA environments live under `environment/`. The CPU lock was exercised locally; the CUDA definition must be validated on the target cluster. Every run records the selected lock-file SHA256 and runtime package/device report.
+Environment evidence has three distinct layers:
+
+1. `environment/image-transfer-cuda.yml` describes the intended CUDA environment;
+2. `freeze_environment` records the complete installed pip set and conda explicit URLs as an exact resolved lock;
+3. `inspect_environment` records the actual Python, package, PyTorch, CUDA, GPU, and Git runtime and binds it to that exact lock.
+
+The source YAML is never accepted as the exact resolved lock.
 
 ```bash
+python -m image_transfer.scripts.freeze_environment \
+  --source-spec environment/image-transfer-cuda.yml \
+  --out readiness/environment_exact_lock.json
 python -m image_transfer.scripts.inspect_environment \
-  --lock environment/requirements-image-lock.txt \
-  --out readiness/environment_report.json
+  --lock readiness/environment_exact_lock.json \
+  --source-spec environment/image-transfer-cuda.yml \
+  --out readiness/environment_runtime_report.json \
+  --require-cuda-exact
 ```
 
-`lock_matches_runtime` must be `true` before a run is submitted. The audit parses exact direct pins, reports every mismatch, and emits a stable `environment_runtime_hash`. GPU configurations reference `environment/image-transfer-cuda.yml`, so their provenance hashes the intended CUDA 12.8 definition rather than the locally tested CPU lock. This CUDA definition is intentionally described as unvalidated until the same audit passes on the target cluster.
+`lock_matches_runtime` must be `true` before submission. The report contains separate canonical hashes for runtime identity and the full report, and comparison rejects missing, changed, or unexpected packages. The exact lock and report must be generated on the target cluster after activating the final environment.
+
+After the report passes, run the configured GPU load probe and real resume probe. The load probe exercises actual batches for both protocols with AMP, GradScaler, AdamW, clipping, and EMA; the resume probe rebuilds state and continues training after a checkpoint reload. CPU smoke output is never marked as GPU evidence.
 
 Metric weights are evaluation assets, not model initialization. Prepare them outside array workers and verify them offline. The asset manifest records relative filename, byte size, SHA256, and package versions. Missing or modified assets make strict preflight fail rather than trigger a compute-node download.
 
