@@ -1,0 +1,9 @@
+# Copy this file, add at least four researcher-selected targets spanning more
+# than one supercategory, document the rationale, and only then set both flags.
+target_set_id: replace-with-reviewed-target-set-id
+target_set_version: "0.1-draft"
+reviewed: false
+frozen: false
+reviewer: null
+review_date: null
+targets: []

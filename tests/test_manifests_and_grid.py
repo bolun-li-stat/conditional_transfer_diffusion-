@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
 import pytest
 
+from image_transfer.config import load_resolved_config, resolve_config
 from image_transfer.data.class_sets import draw_aux_synset_combinations, select_aux_synsets
 from image_transfer.data.manifests import (
     ManifestInsufficientDataError,
     build_data_manifest,
+    build_split_manifest,
+    build_subset_manifest,
     equal_total_feasibility,
     load_manifest,
     persist_or_validate_manifest,
@@ -69,7 +73,7 @@ def test_nested_target_subsets_and_equal_total_feasibility_after_reservations():
     assert unavailable["shortfall"] == 1
 
 
-def test_paper_manifest_never_shrinks_holdouts_silently():
+def test_strict_manifest_never_shrinks_holdouts_silently():
     with pytest.raises(ManifestInsufficientDataError) as error:
         _manifest(target_eval_size=18, target_val_size=3)
     assert error.value.details == {
@@ -91,7 +95,46 @@ def test_manifest_persistence_reuses_canonical_identity(tmp_path: Path):
     assert written == second_path == path
     assert manifest["manifest_hash"] == second["manifest_hash"] == load_manifest(path)["manifest_hash"]
     serialized = json.loads(path.read_text(encoding="utf-8"))
-    assert serialized["schema_version"] == "1.0"
+    assert serialized["schema_version"] == "2.0"
+
+
+def test_v2_holdout_and_training_subset_randomness_are_separate():
+    common = {
+        "dataset_name": "unit-images",
+        "target_class": "target",
+        "holdout_seed": 91,
+        "train_pools": {
+            "target": list(range(40)),
+            "near-a": list(range(100, 140)),
+            "near-b": list(range(200, 240)),
+        },
+        "auxiliary_classes": ["near-a", "near-b"],
+        "target_eval_size": 6,
+        "target_val_size": 4,
+        "auxiliary_eval_size": 3,
+    }
+    split = build_split_manifest(**common)
+    first = build_subset_manifest(split, training_subset_seed=0)
+    second = build_subset_manifest(split, training_subset_seed=1)
+
+    assert first["split_manifest_hash"] == second["split_manifest_hash"] == split["split_manifest_hash"]
+    assert first["subset_manifest_hash"] != second["subset_manifest_hash"]
+    assert first["target_training_order"] != second["target_training_order"]
+    assert set(first["target_training_order"]) == set(second["target_training_order"])
+    assert first["target_training_order"][:5] == first["target_training_order"][:10][:5]
+    assert set(first["auxiliary_training_order"]) == {"near-a", "near-b"}
+
+    changed_holdout = build_split_manifest(**{**common, "holdout_seed": 92})
+    assert changed_holdout["split_manifest_hash"] != split["split_manifest_hash"]
+    assert changed_holdout["target"]["eval"] != split["target"]["eval"]
+
+
+def test_legacy_data_split_seed_maps_to_both_v2_seeds_with_warning():
+    with pytest.warns(DeprecationWarning, match="data_split_seed"):
+        manifest = _manifest(data_split_seed=23)
+    assert manifest["holdout_seed"] == manifest["training_subset_seed"] == 23
+    with pytest.raises(ValueError, match="conflicts with holdout_seed"):
+        _manifest(data_split_seed=23, holdout_seed=24)
 
 
 def test_auxiliary_draws_are_reproducible_and_do_not_fake_replicates():
@@ -113,6 +156,7 @@ def test_auxiliary_draws_are_reproducible_and_do_not_fake_replicates():
 def _grid_config() -> dict:
     return {
         "dataset": "unit-images",
+        "use_fake_data": True,
         "output_root": "results",
         "targets": [{
             "name": "target",
@@ -131,6 +175,7 @@ def _grid_config() -> dict:
         "data_split": {"data_split_seed": 11},
         "experiments": {
             "A": {
+                "enabled": True,
                 "n0_values": [4],
                 "aux_sets": ["close"],
                 "m_per_aux_values": [2, 3],
@@ -139,6 +184,7 @@ def _grid_config() -> dict:
                 "aux_draw_seed": 101,
             },
             "B": {
+                "enabled": True,
                 "n0_values": [4],
                 "aux_sets": ["close"],
                 "total_auxiliary_budget_values": [6],
@@ -253,6 +299,13 @@ def test_training_eval_views_reuse_manifest_indices_and_are_deterministic(tmp_pa
         model_type="conditional_close",
     )
 
+    assert bundle.split_manifest_hash == bundle.manifest["split_manifest_hash"]
+    assert bundle.subset_manifest_hash == bundle.manifest["subset_manifest_hash"]
+    assert bundle.target_training_subset_hash
+    assert bundle.paired_target_prefix_hash == bundle.target_training_subset_hash
+    assert set(bundle.auxiliary_training_subset_hashes) == {"cat"}
+    assert Path(bundle.split_manifest_path).exists()
+    assert Path(bundle.subset_manifest_path).exists()
     assert bundle.target_train.dataset.indices == bundle.target_train_eval.dataset.indices
     assert set(bundle.auxiliary_train_datasets) == set(bundle.auxiliary_train_eval_by_class) == {"cat"}
     assert (
@@ -263,3 +316,64 @@ def test_training_eval_views_reuse_manifest_indices_and_are_deterministic(tmp_pa
     second_image, second_label = bundle.target_train_eval[0]
     assert first_label == second_label == 0
     assert torch.equal(first_image, second_image)
+
+
+def test_config_alias_resolution_conflicts_and_unknown_fields():
+    raw = {
+        "dataset": "unit-images",
+        "use_fake_data": True,
+        "image_size": 8,
+        "targets": [{
+            "name": "target",
+            "synset": "target",
+            "auxiliary_sets": {"close": ["a"], "medium": ["b"], "far": ["c"]},
+        }],
+        "model": {"architecture": "adm_unet", "profile": "smoke_tiny"},
+        "evaluation": {"mode": "paper"},
+        "analysis_plan_path": "image_transfer/configs/analysis_plan.yaml",
+    }
+    with pytest.warns(DeprecationWarning, match="evaluation.mode"):
+        resolved = resolve_config(raw)
+    assert resolved.resolved["evaluation"]["mode"] == "strict"
+    assert resolved.raw_hash != resolved.resolved_hash
+    with pytest.warns(DeprecationWarning):
+        assert resolve_config(copy.deepcopy(raw)).resolved_hash == resolved.resolved_hash
+
+    conflicting = copy.deepcopy(raw)
+    conflicting["sampling_steps"] = 5
+    conflicting["sampling"] = {"steps": 6}
+    with pytest.raises(ValueError, match="Conflicting sampling_steps"):
+        resolve_config(conflicting)
+    with pytest.raises(ValueError, match="Unknown top-level"):
+        resolve_config({**raw, "silently_ignored": True})
+
+
+def test_disabled_experiment_guard_and_release_pilot_grid_identity():
+    disabled = _grid_config()
+    disabled["experiments"]["A"]["enabled"] = False
+    with pytest.raises(ValueError, match="not explicitly enabled"):
+        rows_for_experiment("A", disabled, "unit.yaml")
+    assert rows_for_experiment("A", disabled, "unit.yaml", allow_disabled=True)
+    undeclared = _grid_config()
+    del undeclared["experiments"]["B"]
+    with pytest.raises(ValueError, match="not declared"):
+        rows_for_experiment("B", undeclared, "unit.yaml", allow_disabled=True)
+
+    path = Path("image_transfer/configs/imagenet64_release_pilot.yaml")
+    info = load_resolved_config(path)
+    rows = rows_for_experiment("A", info.raw, str(path), resolved_info=info)
+    assert len(rows) == 12
+    assert {row["model_type"] for row in rows} == {
+        "conditional_target_only_n0", "conditional_close", "conditional_far",
+    }
+    assert len({row["run_id"] for row in rows}) == len(rows)
+    required = {
+        "architecture", "architecture_profile", "model_config_hash", "holdout_seed",
+        "training_subset_seed", "split_manifest_key", "subset_manifest_key", "target_set_hash",
+        "environment_lock_hash", "resolved_run_spec_hash",
+    }
+    assert all(required <= set(row) for row in rows)
+    assert {row["architecture"] for row in rows} == {"adm_unet"}
+    assert {row["architecture_profile"] for row in rows} == {"main_default"}
+    assert {row["holdout_seed"] for row in rows} == {100}
+    assert {row["training_subset_seed"] for row in rows} == {0, 1}

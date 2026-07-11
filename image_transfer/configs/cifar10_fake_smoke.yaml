@@ -1,5 +1,6 @@
 # Offline-only pipeline validation. These synthetic images are not experiment results.
 dataset: cifar10
+study_stage: smoke
 use_fake_data: true
 fake_data_size: 512
 data_root: ${DATA_ROOT:-data}
@@ -16,21 +17,23 @@ targets:
 
 data_split:
   manifest_root: ${RESULTS_ROOT:-image_transfer_results_fake_smoke}/manifests
-  data_split_seed: 0
+  holdout_seed: 0
+  training_subset_seed: 0
   target_eval_size: 16
   target_val_size: 8
   nested_training_subsets: true
   eval_source: train_holdout
   insufficient_data_action: fail
 
-seeds: [0]
-model_initialization_seeds: [0]
-training_seeds: [0]
-sampling_seeds: [1000]
-evaluation_seeds: [2000]
+seed_design:
+  holdout_seed: 0
+  training_subset_seeds: [0]
+  optimization_seed_pairs:
+    - {model_initialization_seed: 0, training_seed: 0}
+  sampling_seed: 1000
+  evaluation_seed: 2000
 training_protocols: [natural_compute_matched]
 n0_values: [8]
-K_aux: 2
 K_aux_values: [2]
 m_per_aux_rule: equal_n0
 num_aux_set_draws: 1
@@ -42,6 +45,8 @@ model:
 diffusion:
   timesteps: 4
   schedule: linear
+  prediction_type: epsilon
+  reverse_variance: fixed
 optimizer:
   name: adamw
   lr: 0.001
@@ -66,8 +71,6 @@ sampling:
   steps: 4
   batch_size: 4
   ddim_eta: 0.0
-sampling_steps: 4
-sampler: ddpm
 num_generated: 8
 
 experiments:
@@ -88,7 +91,10 @@ experiments:
 evaluation:
   mode: debug
   corruption_bank_root: ${RESULTS_ROOT:-image_transfer_results_fake_smoke}/corruption_banks
-  corruptions_per_image: 1
+  validation_corruptions_per_image: 1
+  test_corruptions_per_image: 1
+  train_diagnostic_corruptions_per_image: 1
+  train_diagnostic_max_images: 16
   noise_bins:
     low: [0.0, 0.25]
     mid: [0.25, 0.75]

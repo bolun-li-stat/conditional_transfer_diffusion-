@@ -1,5 +1,6 @@
 # Small real-data pilot; intentionally not a main-scale grid.
 dataset: cifar10
+study_stage: pilot
 use_fake_data: false
 download: true
 data_root: ${DATA_ROOT:-data}
@@ -22,18 +23,23 @@ targets:
 
 data_split:
   manifest_root: ${RESULTS_ROOT:-image_transfer_results_cifar10_pilot}/manifests
-  data_split_seed: 0
+  holdout_seed: 0
+  training_subset_seed: 0
   target_eval_size: 500
   target_val_size: 100
   nested_training_subsets: true
   eval_source: official_test
   insufficient_data_action: skip
 
-seeds: [0, 1, 2]
-model_initialization_seeds: [0, 1, 2]
-training_seeds: [0, 1, 2]
-sampling_seeds: [1000]
-evaluation_seeds: [2000]
+seed_design:
+  holdout_seed: 0
+  training_subset_seeds: [0]
+  optimization_seed_pairs:
+    - {model_initialization_seed: 0, training_seed: 0}
+    - {model_initialization_seed: 1, training_seed: 1}
+    - {model_initialization_seed: 2, training_seed: 2}
+  sampling_seed: 1000
+  evaluation_seed: 2000
 training_protocols: [natural_compute_matched]
 n0_values: [100, 250]
 K_aux_values: [3]
@@ -43,7 +49,7 @@ num_aux_set_draws: 1
 aux_draw_seed: 3000
 
 model: {architecture: adm_unet, profile: pilot_small}
-diffusion: {timesteps: 100, schedule: cosine}
+diffusion: {timesteps: 100, schedule: cosine, prediction_type: epsilon, reverse_variance: fixed}
 optimizer: {name: adamw, lr: 0.0002, betas: [0.9, 0.999], eps: 1.0e-8, weight_decay: 0.0}
 training:
   protocol: natural_compute_matched
@@ -69,7 +75,10 @@ experiments:
 evaluation:
   mode: debug
   corruption_bank_root: ${RESULTS_ROOT:-image_transfer_results_cifar10_pilot}/corruption_banks
-  corruptions_per_image: 2
+  validation_corruptions_per_image: 2
+  test_corruptions_per_image: 2
+  train_diagnostic_corruptions_per_image: 2
+  train_diagnostic_max_images: 128
   compute_fid: false
   compute_kid: false
   compute_prdc: false

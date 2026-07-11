@@ -1,0 +1,25 @@
+analysis_plan_id: image_transfer_v1
+primary:
+  protocol: natural_compute_matched
+  comparisons:
+    - conditional_close_vs_conditional_target_only
+    - conditional_far_vs_conditional_target_only
+  endpoints: [test_epsilon_mse_target, kid_target_mean]
+secondary:
+  comparisons: [conditional_mix_vs_conditional_target_only]
+  endpoints:
+    - fid_target
+    - classifier_target_top1_acc
+    - auxiliary_leakage_rate
+    - density_target
+    - coverage_target
+    - noise_bin_mse
+    - memorization_metrics
+  studies:
+    - target_exposure_control
+    - auxiliary_size_sensitivity
+    - fixed_budget_k_sensitivity
+    - capacity_sensitivity
+transfer_gap_convention:
+  lower_is_better: baseline_minus_model
+  higher_is_better: model_minus_baseline
