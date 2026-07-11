@@ -12,6 +12,7 @@ samples/
 *.npz
 wandb/
 slurm-*.out
+logs/
 *.err
 __pycache__/
 *.pyc
