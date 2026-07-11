@@ -15,17 +15,19 @@ jobs:
     timeout-minutes: 30
     env:
       PYTHONPATH: .
-      TORCH_HOME: ${{ runner.temp }}/empty-torch-cache
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
-      MPLCONFIGDIR: ${{ runner.temp }}/matplotlib
-      RESULTS_ROOT: ${{ runner.temp }}/image-transfer-results
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12.13"
           cache: pip
+      - name: Configure temporary paths
+        run: |
+          echo "TORCH_HOME=$RUNNER_TEMP/empty-torch-cache" >> "$GITHUB_ENV"
+          echo "MPLCONFIGDIR=$RUNNER_TEMP/matplotlib" >> "$GITHUB_ENV"
+          echo "RESULTS_ROOT=$RUNNER_TEMP/image-transfer-results" >> "$GITHUB_ENV"
       - name: Install exact CPU environment
         run: python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu -r environment/requirements-image-lock.txt
       - name: Compile
