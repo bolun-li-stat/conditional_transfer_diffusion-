@@ -125,7 +125,7 @@ def test_offline_cpu_pipeline_to_atomic_results_aggregation_and_plots(tmp_path: 
     result_paths = sorted((results / "run_results").glob("*.json"))
     assert len(result_paths) == 3
     records = [json.loads(path.read_text(encoding="utf-8")) for path in result_paths]
-    assert all(record["status"] == "completed" and record["schema_version"] == 1 for record in records)
+    assert all(record["status"] == "completed" and record["schema_version"] == 2 for record in records)
     assert len({record["metadata"]["manifest_hash"] for record in records}) == 1
     assert len({record["metadata"]["target_eval_indices_hash"] for record in records}) == 1
     assert len({record["metadata"]["target_training_subset_hash"] for record in records}) == 1

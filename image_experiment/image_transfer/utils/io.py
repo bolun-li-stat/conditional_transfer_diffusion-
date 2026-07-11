@@ -16,7 +16,8 @@ from typing import Any
 
 import yaml
 
-RESULT_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 2
+READABLE_RESULT_SCHEMA_VERSIONS = {1, RESULT_SCHEMA_VERSION}
 FAILURE_SCHEMA_VERSION = 1
 
 
@@ -95,6 +96,41 @@ def atomic_write_json(obj: Any, path: str | Path) -> Path:
     return destination
 
 
+def atomic_write_text(text: str, path: str | Path, *, encoding: str = "utf-8") -> Path:
+    """Atomically replace a text file using the same durability contract as JSON."""
+
+    destination = Path(path)
+    ensure_dir(destination.parent)
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding=encoding,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+            delete=False,
+        ) as handle:
+            temp_name = handle.name
+            handle.write(str(text))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, destination)
+        temp_name = None
+        try:
+            directory_fd = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:  # pragma: no cover - filesystem dependent
+            pass
+    finally:
+        if temp_name is not None:
+            Path(temp_name).unlink(missing_ok=True)
+    return destination
+
+
 def write_json(obj: Any, path: str | Path) -> None:
     """Backward-compatible alias; JSON writes are now atomic."""
 
@@ -123,7 +159,7 @@ def validate_result_record(record: Mapping[str, Any], *, expected_run_id: str | 
     if not isinstance(record, Mapping):
         raise ValueError("Run result must be a JSON object")
     version = record.get("schema_version", record.get("result_schema_version"))
-    if version != RESULT_SCHEMA_VERSION:
+    if version not in READABLE_RESULT_SCHEMA_VERSIONS:
         raise ValueError(f"Unsupported run-result schema version {version!r}")
     run_id = record.get("run_id")
     if not isinstance(run_id, str) or not run_id.strip():
@@ -174,6 +210,24 @@ def validate_result_record(record: Mapping[str, Any], *, expected_run_id: str | 
         raise ValueError("Debug result is missing debug_pooled_pixel_distance")
     if metrics.get("evaluation_mode") == "strict" and metrics.get("metric_backend") in {None, ""}:
         raise ValueError("Strict result is missing metric_backend provenance")
+    if version >= 2:
+        for key in (
+            "dataset_identity_hash",
+            "dataset_content_hash",
+            "target_similarity_reference_hash",
+            "similarity_metric_reference_hash",
+            "environment_runtime_hash",
+            "environment_report_hash",
+        ):
+            if metadata.get(key) in {None, ""}:
+                raise ValueError(f"Schema-v2 result metadata is missing required field {key!r}")
+        for key in (
+            "auxiliary_similarity_reference_hashes",
+            "selected_auxiliary_similarity_reference_hashes",
+            "environment_report",
+        ):
+            if not isinstance(metadata.get(key), Mapping):
+                raise ValueError(f"Schema-v2 result metadata field {key!r} must be an object")
 
 
 def normalize_result_record(record: Mapping[str, Any]) -> dict[str, Any]:

@@ -6,6 +6,16 @@ nodes that do not have PyTorch installed.
 
 from __future__ import annotations
 
+from .dataset_identity import (
+    DATASET_IDENTITY_SCHEMA_VERSION,
+    DatasetIdentityError,
+    build_dataset_identity,
+    freeze_dataset_identity,
+    load_dataset_identity,
+    validate_dataset_identity,
+    verify_dataset_identity,
+    verify_dataset_identity_file,
+)
 from .manifests import (
     COMBINED_MANIFEST_SCHEMA_VERSION,
     MANIFEST_SCHEMA_VERSION,
@@ -37,6 +47,14 @@ __all__ = [
     "DatasetBundle",
     "build_datasets_for_job",
     "count_available_target_images",
+    "DATASET_IDENTITY_SCHEMA_VERSION",
+    "DatasetIdentityError",
+    "build_dataset_identity",
+    "freeze_dataset_identity",
+    "load_dataset_identity",
+    "validate_dataset_identity",
+    "verify_dataset_identity",
+    "verify_dataset_identity_file",
     "MANIFEST_SCHEMA_VERSION",
     "SPLIT_MANIFEST_SCHEMA_VERSION",
     "SUBSET_MANIFEST_SCHEMA_VERSION",

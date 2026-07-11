@@ -157,6 +157,8 @@ def build_split_manifest(
     target_eval_size: int = 500,
     target_val_size: int = 100,
     auxiliary_eval_size: int = 100,
+    target_similarity_reference_size: int = 0,
+    auxiliary_similarity_reference_size: int = 0,
     dataset_fingerprint: str | None = None,
     mode: str = "strict",
 ) -> dict[str, Any]:
@@ -189,6 +191,13 @@ def build_split_manifest(
         target_val, target_training = _reserve_exact(
             remaining, target_val_size, what="target validation split", mode=mode, issues=issues
         )
+        target_similarity, target_training = _reserve_exact(
+            target_training,
+            target_similarity_reference_size,
+            what="target similarity reference split",
+            mode=mode,
+            issues=issues,
+        )
         target_training = sorted(target_training)
     else:
         target_training = sorted(train_refs[target_class])
@@ -196,8 +205,15 @@ def build_split_manifest(
         target_eval, remaining = _reserve_exact(
             remaining, target_eval_size, what="target evaluation split", mode=mode, issues=issues
         )
-        target_val, _ = _reserve_exact(
+        target_val, remaining = _reserve_exact(
             remaining, target_val_size, what="target validation split", mode=mode, issues=issues
+        )
+        target_similarity, _ = _reserve_exact(
+            remaining,
+            target_similarity_reference_size,
+            what="target similarity reference split",
+            mode=mode,
+            issues=issues,
         )
 
     auxiliary_pools: dict[str, dict[str, list[str]]] = {}
@@ -213,20 +229,35 @@ def build_split_manifest(
                 mode=mode,
                 issues=issues,
             )
+            aux_similarity, aux_train = _reserve_exact(
+                aux_train,
+                auxiliary_similarity_reference_size,
+                what=f"auxiliary similarity reference split for {auxiliary}",
+                mode=mode,
+                issues=issues,
+            )
             aux_train = sorted(aux_train)
         else:
             aux_train = sorted(train_refs[auxiliary])
             candidates = _shuffled(eval_refs.get(auxiliary, []), seed, f"aux:{auxiliary}:{eval_source}:holdout")
-            aux_eval, _ = _reserve_exact(
+            aux_eval, candidates = _reserve_exact(
                 candidates,
                 auxiliary_eval_size,
                 what=f"auxiliary evaluation split for {auxiliary}",
                 mode=mode,
                 issues=issues,
             )
+            aux_similarity, _ = _reserve_exact(
+                candidates,
+                auxiliary_similarity_reference_size,
+                what=f"auxiliary similarity reference split for {auxiliary}",
+                mode=mode,
+                issues=issues,
+            )
         auxiliary_pools[auxiliary] = {
             "train_candidate_pool": aux_train,
             "eval_candidate_pool": aux_eval,
+            "similarity_reference": aux_similarity,
         }
 
     fingerprint = _dataset_fingerprint(dataset_name, train_pools, eval_pools, dataset_fingerprint)
@@ -242,10 +273,13 @@ def build_split_manifest(
             "target_eval_size": int(target_eval_size),
             "target_validation_size": int(target_val_size),
             "auxiliary_eval_size_per_class": int(auxiliary_eval_size),
+            "target_similarity_reference_size": int(target_similarity_reference_size),
+            "auxiliary_similarity_reference_size_per_class": int(auxiliary_similarity_reference_size),
         },
         "target": {
             "eval": target_eval,
             "validation": target_val,
+            "similarity_reference": target_similarity,
             "train_candidate_pool": target_training,
         },
         "auxiliary": auxiliary_pools,
@@ -254,16 +288,27 @@ def build_split_manifest(
             "requested_target_validation": int(target_val_size),
             "actual_target_eval": len(target_eval),
             "actual_target_validation": len(target_val),
+            "actual_target_similarity_reference": len(target_similarity),
             "target_training_available": len(target_training),
             "requested_auxiliary_eval_per_class": int(auxiliary_eval_size),
+            "requested_target_similarity_reference": int(target_similarity_reference_size),
+            "requested_auxiliary_similarity_reference_per_class": int(auxiliary_similarity_reference_size),
             "auxiliary_training_available": {
                 label: len(pools["train_candidate_pool"]) for label, pools in auxiliary_pools.items()
             },
             "auxiliary_eval_available": {
                 label: len(pools["eval_candidate_pool"]) for label, pools in auxiliary_pools.items()
             },
+            "auxiliary_similarity_reference_available": {
+                label: len(pools["similarity_reference"]) for label, pools in auxiliary_pools.items()
+            },
         },
         "feasibility_issues": issues,
+    }
+    payload["target_similarity_reference_hash"] = canonical_sha256(target_similarity)
+    payload["auxiliary_similarity_reference_hashes"] = {
+        label: canonical_sha256(pools["similarity_reference"])
+        for label, pools in sorted(auxiliary_pools.items())
     }
     payload["split_manifest_hash"] = canonical_sha256(payload)
     validate_split_manifest(payload)
@@ -324,6 +369,7 @@ def combine_manifests(
         str(label): {
             "train_candidate_pool": list(subset_manifest["auxiliary_training_order"][label]),
             "eval_candidate_pool": list(pools["eval_candidate_pool"]),
+            "similarity_reference": list(pools["similarity_reference"]),
         }
         for label, pools in split_manifest.get("auxiliary", {}).items()
     }
@@ -344,10 +390,15 @@ def combine_manifests(
         "target": {
             "eval": list(split_manifest["target"]["eval"]),
             "validation": list(split_manifest["target"]["validation"]),
+            "similarity_reference": list(split_manifest["target"]["similarity_reference"]),
             "train_candidate_pool": list(subset_manifest["target_training_order"]),
         },
         "auxiliary": auxiliary,
         "split_sizes": dict(split_manifest["split_sizes"]),
+        "target_similarity_reference_hash": split_manifest["target_similarity_reference_hash"],
+        "auxiliary_similarity_reference_hashes": dict(
+            split_manifest["auxiliary_similarity_reference_hashes"]
+        ),
         "feasibility_issues": list(split_manifest.get("feasibility_issues", [])),
     }
     payload["manifest_hash"] = canonical_sha256(
@@ -375,6 +426,8 @@ def build_data_manifest(
     target_eval_size: int = 500,
     target_val_size: int = 100,
     auxiliary_eval_size: int = 100,
+    target_similarity_reference_size: int = 0,
+    auxiliary_similarity_reference_size: int = 0,
     experiment_family: str = "image_transfer",
     dataset_fingerprint: str | None = None,
     mode: str = "strict",
@@ -403,6 +456,8 @@ def build_data_manifest(
         target_eval_size=target_eval_size,
         target_val_size=target_val_size,
         auxiliary_eval_size=auxiliary_eval_size,
+        target_similarity_reference_size=target_similarity_reference_size,
+        auxiliary_similarity_reference_size=auxiliary_similarity_reference_size,
         dataset_fingerprint=dataset_fingerprint,
         mode=mode,
     )
@@ -430,11 +485,26 @@ def validate_split_manifest(manifest: Mapping[str, Any]) -> None:
     train = set(target.get("train_candidate_pool", []))
     validation = set(target.get("validation", []))
     evaluation = set(target.get("eval", []))
-    if train & validation or train & evaluation or validation & evaluation:
-        raise ManifestError("Target train/validation/evaluation splits overlap")
+    similarity = set(target.get("similarity_reference", []))
+    target_parts = [train, validation, evaluation, similarity]
+    if any(left & right for index, left in enumerate(target_parts) for right in target_parts[index + 1 :]):
+        raise ManifestError("Target train/validation/evaluation/similarity splits overlap")
+    if manifest.get("target_similarity_reference_hash") != canonical_sha256(
+        list(target.get("similarity_reference", []))
+    ):
+        raise ManifestError("Target similarity-reference hash mismatch")
+    expected_auxiliary_hashes: dict[str, str] = {}
     for label, pools in manifest.get("auxiliary", {}).items():
-        if set(pools.get("train_candidate_pool", [])) & set(pools.get("eval_candidate_pool", [])):
-            raise ManifestError(f"Auxiliary train/evaluation splits overlap for {label}")
+        train_pool = set(pools.get("train_candidate_pool", []))
+        eval_pool = set(pools.get("eval_candidate_pool", []))
+        similarity_pool = set(pools.get("similarity_reference", []))
+        if train_pool & eval_pool or train_pool & similarity_pool or eval_pool & similarity_pool:
+            raise ManifestError(f"Auxiliary train/evaluation/similarity splits overlap for {label}")
+        expected_auxiliary_hashes[str(label)] = canonical_sha256(
+            list(pools.get("similarity_reference", []))
+        )
+    if manifest.get("auxiliary_similarity_reference_hashes") != expected_auxiliary_hashes:
+        raise ManifestError("Auxiliary similarity-reference hashes mismatch")
 
 
 def validate_subset_manifest(

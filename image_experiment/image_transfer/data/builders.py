@@ -9,6 +9,11 @@ from torch.utils.data import ConcatDataset, Dataset, Subset
 
 from image_transfer.utils.io import resolve_env_path
 from .cifar import BlockLabeledDataset, RemappedDataset, build_fake_data, class_id, load_cifar10
+from .dataset_identity import (
+    DatasetIdentityError,
+    build_dataset_identity,
+    verify_dataset_identity,
+)
 from .imagenet_subset import RemappedImageFolder, load_imagefolder, validate_synsets
 from .manifests import (
     ManifestInsufficientDataError,
@@ -65,6 +70,8 @@ class DatasetBundle:
     auxiliary_train_datasets: dict[str, Dataset] = field(default_factory=dict)
     auxiliary_train_eval_by_class: dict[str, Dataset] = field(default_factory=dict)
     auxiliary_eval_by_class: dict[str, Dataset] = field(default_factory=dict)
+    target_similarity_reference: Dataset | None = None
+    auxiliary_similarity_reference_by_class: dict[str, Dataset] = field(default_factory=dict)
     manifest: dict[str, Any] = field(default_factory=dict)
     manifest_hash: str = ""
     manifest_path: str = ""
@@ -79,6 +86,12 @@ class DatasetBundle:
     target_training_subset_hash: str = ""
     paired_target_prefix_hash: str = ""
     auxiliary_training_subset_hashes: dict[str, str] = field(default_factory=dict)
+    target_similarity_reference_hash: str = ""
+    auxiliary_similarity_reference_hashes: dict[str, str] = field(default_factory=dict)
+    dataset_identity: dict[str, Any] = field(default_factory=dict)
+    dataset_identity_hash: str = ""
+    dataset_content_hash: str = ""
+    dataset_identity_path: str = ""
     feasibility: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -138,12 +151,20 @@ def _split_settings(cfg: Mapping[str, Any], *, num_auxiliary_classes: int) -> di
     if source in {"val", "validation", "test", "official"}:
         source = "test" if str(cfg.get("dataset", "")).lower().startswith("cifar") else "val"
     aux_eval_default = max(1, eval_size // max(num_auxiliary_classes, 1))
+    mode = str(evaluation.get("mode", "debug" if cfg.get("use_fake_data", False) else "strict"))
+    strict_reference_default = 100 if mode == "strict" else 0
     return {
         "eval_source": source,
         "target_eval_size": eval_size,
         "target_val_size": val_size,
         "auxiliary_eval_size": int(split.get("auxiliary_eval_size", aux_eval_default)),
-        "mode": str(evaluation.get("mode", "debug" if cfg.get("use_fake_data", False) else "strict")),
+        "mode": mode,
+        "target_similarity_reference_size": int(
+            split.get("target_similarity_reference_size", strict_reference_default)
+        ),
+        "auxiliary_similarity_reference_size": int(
+            split.get("auxiliary_similarity_reference_size", strict_reference_default)
+        ),
         "nested_training_subsets": bool(split.get("nested_training_subsets", True)),
     }
 
@@ -236,6 +257,8 @@ def _create_and_persist_manifests(
         target_eval_size=settings["target_eval_size"],
         target_val_size=settings["target_val_size"],
         auxiliary_eval_size=settings["auxiliary_eval_size"],
+        target_similarity_reference_size=settings["target_similarity_reference_size"],
+        auxiliary_similarity_reference_size=settings["auxiliary_similarity_reference_size"],
         dataset_fingerprint=dataset_fingerprint,
         mode=settings["mode"],
     )
@@ -272,7 +295,13 @@ def count_available_target_images(cfg: dict[str, Any], target_synset: str) -> in
     image_size = int(cfg.get("image_size", 32))
     data_root = resolve_env_path(cfg.get("data_root"), "data")
     settings = _split_settings(cfg, num_auxiliary_classes=0)
-    reserve = settings["target_eval_size"] + settings["target_val_size"] if settings["eval_source"] == "train_holdout" else 0
+    reserve = (
+        settings["target_eval_size"]
+        + settings["target_val_size"]
+        + settings["target_similarity_reference_size"]
+        if settings["eval_source"] == "train_holdout"
+        else 0
+    )
     if cfg.get("use_fake_data", False):
         raw = int(cfg.get("fake_data_size", 100000))
     elif dataset_name.startswith("cifar"):
@@ -297,12 +326,15 @@ def build_datasets_for_job(
     seed: int,
     model_type: str,
     manifest: Mapping[str, Any] | None = None,
+    dataset_identity: Mapping[str, Any] | None = None,
+    dataset_identity_path: str | Path | None = None,
 ) -> DatasetBundle:
     """Build job datasets from one persisted, model-independent manifest.
 
     The legacy keyword-only signature remains valid.  Callers may additionally
-    provide a preloaded ``manifest``; otherwise it is deterministically created
-    from ``data_split_seed`` and persisted beneath ``data_split.manifest_root``.
+    provide a preloaded ``manifest``; otherwise its holdout and training-subset
+    layers are created from their independent v2 seeds and persisted beneath
+    ``data_split.manifest_root``.
     """
 
     dataset_name = str(cfg.get("dataset", "cifar10")).lower()
@@ -324,6 +356,16 @@ def build_datasets_for_job(
     eval_pools: dict[str, list[int]] | None
     fingerprint: str | None = None
     source = _split_settings(cfg, num_auxiliary_classes=len(all_auxiliary))["eval_source"]
+    mode = _split_settings(cfg, num_auxiliary_classes=len(all_auxiliary))["mode"]
+    if dataset_identity is None:
+        if mode == "strict" and not bool(cfg.get("use_fake_data", False)):
+            raise DatasetIdentityError(
+                "Strict dataset construction requires a verified frozen dataset identity"
+            )
+        current_dataset_identity = build_dataset_identity(cfg)
+    else:
+        current_dataset_identity = verify_dataset_identity(cfg, dataset_identity)
+    identity_fingerprint = str(current_dataset_identity["dataset_content_hash"])
 
     if cfg.get("use_fake_data", False):
         all_classes = list(dict.fromkeys([target_class, *all_auxiliary]))
@@ -342,15 +384,7 @@ def build_datasets_for_job(
             label: list(range(index * per_class, (index + 1) * per_class)) for label, index in label_ids.items()
         }
         eval_pools = dict(train_pools) if source != "train_holdout" else None
-        fingerprint = canonical_sha256(
-            {
-                "kind": "FakeData",
-                "per_class": per_class,
-                "classes": all_classes,
-                "image_size": image_size,
-                "dataset_generation_seed": fake_data_seed,
-            }
-        )
+        fingerprint = identity_fingerprint
     elif dataset_name.startswith("cifar"):
         train_base = load_cifar10(data_root, image_size, train=True, download=bool(cfg.get("download", True)))
         train_eval_base = load_cifar10(
@@ -368,6 +402,7 @@ def build_datasets_for_job(
             label: [index for index, y in enumerate(official_eval_base.targets) if int(y) == old]
             for label, old in label_ids.items()
         } if source != "train_holdout" else None
+        fingerprint = identity_fingerprint
     else:
         classes = [target_class, *all_auxiliary]
         validate_synsets(data_root, "train", classes)
@@ -387,7 +422,7 @@ def build_datasets_for_job(
                 label: [index for index, (_, y) in enumerate(official_eval_base.samples) if y == official_eval_base.class_to_idx[label]]
                 for label in classes
             }
-        fingerprint = _imagefolder_fingerprint(train_base, classes, official_eval_base)
+        fingerprint = identity_fingerprint
 
     if manifest is None:
         split_manifest, subset_manifest, persisted_split_path, persisted_subset_path = _create_and_persist_manifests(
@@ -489,20 +524,26 @@ def build_datasets_for_job(
 
     target_val = target_holdout_dataset("validation")
     target_eval = target_holdout_dataset("eval")
+    target_similarity_reference = target_holdout_dataset("similarity_reference")
 
     auxiliary_eval_by_class: dict[str, Dataset] = {}
+    auxiliary_similarity_reference_by_class: dict[str, Dataset] = {}
     for position, auxiliary in enumerate(selected_auxiliary, start=1):
-        references = list(loaded_manifest["auxiliary"][auxiliary]["eval_candidate_pool"])
-        expected_source = "train" if source == "train_holdout" else source
-        indices = _indices(references, {expected_source})
-        base = train_eval_base if source == "train_holdout" else official_eval_base
-        assert base is not None
-        old = label_ids[auxiliary] if source == "train_holdout" or dataset_name.startswith("cifar") or cfg.get("use_fake_data", False) else base.class_to_idx[auxiliary]
-        if dataset_name.startswith("cifar") or cfg.get("use_fake_data", False):
-            dataset = RemappedDataset(Subset(base, indices), [old], {old: position})
-        else:
-            dataset = RemappedImageFolder(Subset(base, indices), {old: position})
-        auxiliary_eval_by_class[auxiliary] = dataset
+        for key, destination in (
+            ("eval_candidate_pool", auxiliary_eval_by_class),
+            ("similarity_reference", auxiliary_similarity_reference_by_class),
+        ):
+            references = list(loaded_manifest["auxiliary"][auxiliary][key])
+            expected_source = "train" if source == "train_holdout" else source
+            indices = _indices(references, {expected_source})
+            base = train_eval_base if source == "train_holdout" else official_eval_base
+            assert base is not None
+            old = label_ids[auxiliary] if source == "train_holdout" or dataset_name.startswith("cifar") or cfg.get("use_fake_data", False) else base.class_to_idx[auxiliary]
+            if dataset_name.startswith("cifar") or cfg.get("use_fake_data", False):
+                dataset = RemappedDataset(Subset(base, indices), [old], {old: position})
+            else:
+                dataset = RemappedImageFolder(Subset(base, indices), {old: position})
+            destination[auxiliary] = dataset
 
     return DatasetBundle(
         train=train,
@@ -520,6 +561,8 @@ def build_datasets_for_job(
         auxiliary_train_datasets=auxiliary_train_by_class,
         auxiliary_train_eval_by_class=auxiliary_train_eval_by_class,
         auxiliary_eval_by_class=auxiliary_eval_by_class,
+        target_similarity_reference=target_similarity_reference,
+        auxiliary_similarity_reference_by_class=auxiliary_similarity_reference_by_class,
         manifest=loaded_manifest,
         manifest_hash=str(loaded_manifest["manifest_hash"]),
         manifest_path=str(persisted_subset_path),
@@ -536,5 +579,13 @@ def build_datasets_for_job(
         auxiliary_training_subset_hashes={
             auxiliary: canonical_sha256(references) for auxiliary, references in sorted(aux_refs.items())
         },
+        target_similarity_reference_hash=str(split_manifest["target_similarity_reference_hash"]),
+        auxiliary_similarity_reference_hashes=dict(
+            split_manifest["auxiliary_similarity_reference_hashes"]
+        ),
+        dataset_identity=current_dataset_identity,
+        dataset_identity_hash=str(current_dataset_identity["dataset_identity_hash"]),
+        dataset_content_hash=str(current_dataset_identity["dataset_content_hash"]),
+        dataset_identity_path=str(dataset_identity_path or ""),
         feasibility=feasibility,
     )

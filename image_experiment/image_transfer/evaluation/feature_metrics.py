@@ -171,7 +171,7 @@ def _build_torchmetrics_extractor(feature_dimension: int, device: torch.device):
     except Exception as exc:
         raise MetricBackendError(
             "strict evaluation requires torchmetrics with torch-fidelity support; "
-            "install requirements-image.txt and make the Inception weights available"
+            "install the image_experiment requirements and make the Inception weights available"
         ) from exc
     try:
         metric = FrechetInceptionDistance(feature=int(feature_dimension), normalize=False).to(device)

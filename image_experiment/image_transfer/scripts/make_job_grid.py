@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 from collections import Counter
@@ -10,7 +11,13 @@ from typing import Any, Mapping
 
 from image_transfer.config import ResolvedConfig, load_resolved_config, resolve_config
 from image_transfer.data.class_sets import class_name, draw_aux_synset_combinations
+from image_transfer.data.dataset_identity import (
+    DatasetIdentityError,
+    build_dataset_identity,
+    verify_dataset_identity_file,
+)
 from image_transfer.data.manifests import canonical_sha256
+from image_transfer.environment_lock import load_exact_environment_lock
 from image_transfer.models.model_factory import model_config_hash, resolve_model_config
 from image_transfer.readiness import enforce_readiness_gate
 from image_transfer.utils.io import ensure_dir, resolve_env_path
@@ -21,6 +28,7 @@ EXP_NAME = {"A": "equal_target", "B": "equal_total", "C": "similarity_sweep"}
 JOB_FIELDS = [
     "experiment",
     "experiment_name",
+    "design_label",
     "dataset",
     "target_synset",
     "target_name",
@@ -59,6 +67,15 @@ JOB_FIELDS = [
     "study_plan_hash",
     "target_set_hash",
     "environment_lock_hash",
+    "exact_environment_lock_path",
+    "exact_environment_lock_hash",
+    "exact_environment_lock_status",
+    "dataset_identity_path",
+    "dataset_identity_hash",
+    "dataset_content_hash",
+    "dataset_identity_status",
+    "runnable",
+    "runnable_reason",
     "readiness_gate_required",
     "readiness_gate_override",
     "readiness_gate_status",
@@ -101,12 +118,12 @@ def _values(exp_cfg: Mapping[str, Any], cfg: Mapping[str, Any], key: str) -> lis
     return _as_list(cfg.get(key))
 
 
-def _size_grid(exp_cfg: Mapping[str, Any], cfg: Mapping[str, Any], n0: int) -> list[tuple[int, int, int]]:
-    """Return unique ``(m_per_aux, K_aux, total_auxiliary_budget)`` settings."""
+def _size_grid(exp_cfg: Mapping[str, Any], cfg: Mapping[str, Any], n0: int) -> list[tuple[int, int, int, str]]:
+    """Return unique size settings while preserving their declared design."""
 
     explicit_settings = exp_cfg.get("auxiliary_size_settings", cfg.get("auxiliary_size_settings"))
     if explicit_settings:
-        settings: list[tuple[int, int, int]] = []
+        settings: list[tuple[int, int, int, str]] = []
         for setting in explicit_settings:
             k_aux = int(setting["K_aux"])
             if k_aux <= 0:
@@ -114,9 +131,11 @@ def _size_grid(exp_cfg: Mapping[str, Any], cfg: Mapping[str, Any], n0: int) -> l
             if "m_per_aux" in setting:
                 m_per_aux = int(setting["m_per_aux"])
                 budget = m_per_aux * k_aux
+                inferred_label = "equal_per_class_auxiliary_amount"
             elif "auxiliary_ratio" in setting:
                 m_per_aux = max(1, int(round(float(setting["auxiliary_ratio"]) * int(n0))))
                 budget = m_per_aux * k_aux
+                inferred_label = "scaled_per_class_auxiliary_amount"
             else:
                 budget = int(setting["total_auxiliary_budget"])
                 if budget <= 0 or budget % k_aux:
@@ -124,14 +143,18 @@ def _size_grid(exp_cfg: Mapping[str, Any], cfg: Mapping[str, Any], n0: int) -> l
                         f"total_auxiliary_budget={budget} must be positive and divisible by K_aux={k_aux}"
                     )
                 m_per_aux = budget // k_aux
+                inferred_label = "fixed_total_auxiliary_budget"
             if m_per_aux <= 0:
                 raise ValueError("m_per_aux must be positive in auxiliary_size_settings")
-            settings.append((m_per_aux, k_aux, budget))
+            design_label = str(setting.get("design_label", inferred_label)).strip()
+            if not design_label:
+                raise ValueError("design_label cannot be empty in auxiliary_size_settings")
+            settings.append((m_per_aux, k_aux, budget, design_label))
         return list(dict.fromkeys(settings))
 
     k_values = _values(exp_cfg, cfg, "K_aux_values") or [int(cfg.get("K_aux", 5))]
     budgets = _values(exp_cfg, cfg, "total_auxiliary_budget_values")
-    settings: list[tuple[int, int, int]] = []
+    settings: list[tuple[int, int, int, str]] = []
     if budgets:
         for budget in map(int, budgets):
             for k_aux in map(int, k_values):
@@ -142,7 +165,7 @@ def _size_grid(exp_cfg: Mapping[str, Any], cfg: Mapping[str, Any], n0: int) -> l
                     raise ValueError(
                         f"total_auxiliary_budget={budget} must be divisible by K_aux={k_aux}"
                     )
-                settings.append((budget // k_aux, k_aux, budget))
+                settings.append((budget // k_aux, k_aux, budget, "fixed_total_auxiliary_budget"))
     else:
         explicit_m = _values(exp_cfg, cfg, "m_per_aux_values")
         ratios = _values(exp_cfg, cfg, "auxiliary_ratio_values")
@@ -156,7 +179,12 @@ def _size_grid(exp_cfg: Mapping[str, Any], cfg: Mapping[str, Any], n0: int) -> l
             for k_aux in map(int, k_values):
                 if m_per_aux < 0 or k_aux < 0:
                     raise ValueError("m_per_aux and K_aux must be non-negative")
-                settings.append((m_per_aux, k_aux, m_per_aux * k_aux))
+                label = (
+                    "scaled_per_class_auxiliary_amount"
+                    if ratios and not explicit_m
+                    else "equal_per_class_auxiliary_amount"
+                )
+                settings.append((m_per_aux, k_aux, m_per_aux * k_aux, label))
     return list(dict.fromkeys(settings))
 
 
@@ -170,7 +198,7 @@ def _broadcast_seed_values(values: list[Any], count: int, name: str, default_val
     return [int(value) for value in values]
 
 
-def _seed_records(cfg: Mapping[str, Any]) -> list[dict[str, int]]:
+def _seed_records(cfg: Mapping[str, Any]) -> list[dict[str, Any]]:
     design = cfg.get("seed_design")
     if design:
         holdout_seed = int(design["holdout_seed"])
@@ -178,7 +206,9 @@ def _seed_records(cfg: Mapping[str, Any]) -> list[dict[str, int]]:
         evaluation_seed = int(design["evaluation_seed"])
         return [
             {
-                "data_split_seed": holdout_seed,
+                # The column remains in CSVs for old readers, but a v2 design
+                # must never route it back into manifest seed resolution.
+                "data_split_seed": "",
                 "holdout_seed": holdout_seed,
                 "training_subset_seed": int(subset_seed),
                 "model_initialization_seed": int(pair["model_initialization_seed"]),
@@ -256,12 +286,42 @@ def _safe(value: Any) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value)).strip("-.") or "none"
 
 
+def _short_model_type(value: Any) -> str:
+    text = str(value)
+    aliases = {
+        "unconditional_n0": "u-n0",
+        "conditional_target_only_n0": "cto-n0",
+        "unconditional_equal_total": "u-eqtotal",
+        "conditional_target_only_equal_total": "cto-eqtotal",
+    }
+    if text in aliases:
+        return aliases[text]
+    if text.startswith("conditional_"):
+        return "c-" + _safe(text.removeprefix("conditional_"))[:20]
+    if text.startswith("similarity_"):
+        return "sim-" + _safe(text.removeprefix("similarity_"))[:18]
+    return _safe(text)[:24]
+
+
+def _short_design_label(value: Any) -> str:
+    text = str(value)
+    aliases = {
+        "equal_per_class_auxiliary_amount": "epc",
+        "fixed_total_auxiliary_budget": "fixed",
+        "scaled_per_class_auxiliary_amount": "scaled",
+        "legacy_unspecified": "legacy",
+    }
+    return aliases.get(text, canonical_sha256({"design_label": text})[:8])
+
+
 RUN_SPEC_FIELDS = (
-    "dataset", "experiment", "target_synset", "model_type", "aux_set", "aux_composition", "aux_draw_id",
+    "dataset", "experiment", "design_label", "target_synset", "model_type", "aux_set", "aux_composition", "aux_draw_id",
     "n0", "m_per_aux", "K_aux", "total_auxiliary_budget", "training_protocol", "holdout_seed",
     "training_subset_seed", "model_initialization_seed", "training_seed", "sampling_seed", "evaluation_seed",
     "sampler", "sampling_steps", "architecture", "architecture_profile", "model_config_hash",
     "resolved_config_hash", "study_plan_hash", "target_set_hash", "environment_lock_hash",
+    "dataset_identity_hash", "dataset_content_hash", "dataset_identity_status",
+    "exact_environment_lock_hash", "exact_environment_lock_status", "runnable",
     "readiness_gate_required", "readiness_gate_override", "readiness_gate_status", "readiness_gate_passed",
     "readiness_gate_mismatches", "readiness_status_file_hash", "readiness_pilot_config_hash",
     "readiness_validated_git_sha", "readiness_current_git_sha",
@@ -278,12 +338,127 @@ def compute_resolved_run_spec_hash(row: Mapping[str, Any]) -> str:
     return canonical_sha256(payload)
 
 
+def _config_relative_path(value: Any, config_path: str | Path) -> Path:
+    expanded = resolve_env_path(None if value is None else str(value))
+    path = Path(expanded).expanduser()
+    return path.resolve() if path.is_absolute() else (Path(config_path).resolve().parent / path).resolve()
+
+
+def dataset_identity_grid_state(
+    cfg: Mapping[str, Any], config_path: str | Path
+) -> dict[str, Any]:
+    """Resolve strict runnability without preventing shape-only grid creation."""
+
+    mode = str(cfg.get("evaluation", {}).get("mode", "debug" if cfg.get("use_fake_data") else "strict"))
+    configured = cfg.get("dataset_identity_path")
+    expanded_configured = resolve_env_path(None if configured is None else str(configured))
+    if bool(cfg.get("use_fake_data", False)) and not expanded_configured:
+        identity = build_dataset_identity(cfg)
+        return {
+            "dataset_identity_path": "",
+            "dataset_identity_hash": identity["dataset_identity_hash"],
+            "dataset_content_hash": identity["dataset_content_hash"],
+            "dataset_identity_status": "synthetic_debug",
+            "runnable": True,
+            "runnable_reason": "",
+        }
+    if not expanded_configured:
+        strict = mode == "strict"
+        return {
+            "dataset_identity_path": "",
+            "dataset_identity_hash": "",
+            "dataset_content_hash": "",
+            "dataset_identity_status": "unresolved_strict" if strict else "unfrozen_debug",
+            "runnable": not strict,
+            "runnable_reason": "missing_frozen_dataset_identity" if strict else "",
+        }
+    identity_path = _config_relative_path(expanded_configured, config_path)
+    try:
+        identity = verify_dataset_identity_file(cfg, identity_path)
+    except (DatasetIdentityError, OSError, ValueError) as exception:
+        return {
+            "dataset_identity_path": str(identity_path),
+            "dataset_identity_hash": "",
+            "dataset_content_hash": "",
+            "dataset_identity_status": "unresolved_strict" if mode == "strict" else "invalid_debug",
+            "runnable": False,
+            "runnable_reason": f"dataset_identity_verification_failed: {exception}",
+        }
+    return {
+        "dataset_identity_path": str(identity_path),
+        "dataset_identity_hash": identity["dataset_identity_hash"],
+        "dataset_content_hash": identity["dataset_content_hash"],
+        "dataset_identity_status": "frozen_verified",
+        "runnable": True,
+        "runnable_reason": "",
+    }
+
+
+def exact_environment_grid_state(
+    cfg: Mapping[str, Any], config_path: str | Path
+) -> dict[str, Any]:
+    """Bind strict executable rows to a validated exact package lock."""
+
+    mode = str(cfg.get("evaluation", {}).get("mode", "debug" if cfg.get("use_fake_data") else "strict"))
+    configured = cfg.get("exact_environment_lock_path")
+    expanded = resolve_env_path(None if configured is None else str(configured))
+    if not expanded:
+        strict = mode == "strict"
+        return {
+            "exact_environment_lock_path": "",
+            "exact_environment_lock_hash": "",
+            "exact_environment_lock_status": "unresolved_strict" if strict else "not_required_debug",
+            "runnable": not strict,
+            "runnable_reason": "missing_exact_environment_lock" if strict else "",
+        }
+    lock_path = _config_relative_path(expanded, config_path)
+    try:
+        load_exact_environment_lock(lock_path)
+        digest = hashlib.sha256(lock_path.read_bytes()).hexdigest()
+    except (OSError, ValueError, json.JSONDecodeError) as exception:
+        return {
+            "exact_environment_lock_path": str(lock_path),
+            "exact_environment_lock_hash": "",
+            "exact_environment_lock_status": "unresolved_strict" if mode == "strict" else "invalid_debug",
+            "runnable": False,
+            "runnable_reason": f"exact_environment_lock_verification_failed: {exception}",
+        }
+    return {
+        "exact_environment_lock_path": str(lock_path),
+        "exact_environment_lock_hash": digest,
+        "exact_environment_lock_status": "frozen_verified",
+        "runnable": True,
+        "runnable_reason": "",
+    }
+
+
+def execution_grid_state(cfg: Mapping[str, Any], config_path: str | Path) -> dict[str, Any]:
+    """Return the complete data-and-environment execution identity."""
+
+    identity_fields = dataset_identity_grid_state(cfg, config_path)
+    environment_fields = exact_environment_grid_state(cfg, config_path)
+    runnable = bool(identity_fields["runnable"] and environment_fields["runnable"])
+    reasons = [
+        str(fields["runnable_reason"])
+        for fields in (identity_fields, environment_fields)
+        if fields.get("runnable_reason")
+    ]
+    return {
+        **identity_fields,
+        **environment_fields,
+        "runnable": runnable,
+        "runnable_reason": ";".join(reasons),
+    }
+
+
 def run_id_for_row(row: Mapping[str, Any]) -> str:
+    # Keep basenames comfortably below the common 255-byte filesystem limit.
+    # The complete, content-bound identity remains in resolved_run_spec_hash.
     parts = [
         row["experiment"],
-        row["target_synset"],
-        row["model_type"],
-        row["aux_set"],
+        _safe(row["target_synset"])[:16],
+        _short_model_type(row["model_type"]),
+        f"d{_short_design_label(row['design_label'])}",
         f"draw{row['aux_draw_id']}",
         f"n0{row['n0']}",
         f"m{row['m_per_aux']}",
@@ -293,14 +468,6 @@ def run_id_for_row(row: Mapping[str, Any]) -> str:
         f"mi{row['model_initialization_seed']}",
         f"tr{row['training_seed']}",
         row["training_protocol"],
-        row.get("architecture", "legacy_simple_unet"),
-        row.get("architecture_profile", "legacy"),
-        f"mh{str(row.get('model_config_hash', ''))[:12]}",
-        row["sampler"],
-        f"ss{row['sampling_seed']}",
-        f"ev{row['evaluation_seed']}",
-        f"th{str(row.get('target_set_hash', ''))[:12]}",
-        f"eh{str(row.get('environment_lock_hash', ''))[:12]}",
         f"ch{str(row.get('resolved_config_hash', row.get('config_hash', '')))[:12]}",
         f"spec{str(row['resolved_run_spec_hash'])[:16]}",
     ]
@@ -322,6 +489,8 @@ def _model_identity(cfg: Mapping[str, Any], profile: str) -> tuple[str, str, str
 
 def compute_manifest_keys(cfg: Mapping[str, Any], target_synset: str, seeds: Mapping[str, int]) -> tuple[str, str]:
     split = cfg.get("data_split", {})
+    mode = str(cfg.get("evaluation", {}).get("mode", "debug" if cfg.get("use_fake_data") else "strict"))
+    similarity_default = 100 if mode == "strict" else 0
     split_key = canonical_sha256(
         {
             "schema": "split-key-v2",
@@ -331,6 +500,12 @@ def compute_manifest_keys(cfg: Mapping[str, Any], target_synset: str, seeds: Map
             "target_eval_size": int(split.get("target_eval_size", 500)),
             "target_val_size": int(split.get("target_val_size", 100)),
             "auxiliary_eval_size": int(split.get("auxiliary_eval_size", 100)),
+            "target_similarity_reference_size": int(
+                split.get("target_similarity_reference_size", similarity_default)
+            ),
+            "auxiliary_similarity_reference_size": int(
+                split.get("auxiliary_similarity_reference_size", similarity_default)
+            ),
             "eval_source": str(split.get("eval_source", "train_holdout")),
         }
     )
@@ -355,6 +530,7 @@ def _row(
     m_per_aux: int,
     k_aux: int,
     total_auxiliary_budget: int,
+    design_label: str,
     seeds: Mapping[str, int],
     training_protocol: str,
     model_type: str,
@@ -376,6 +552,7 @@ def _row(
     row: dict[str, Any] = {
         "experiment": exp,
         "experiment_name": EXP_NAME[exp],
+        "design_label": str(design_label),
         "dataset": cfg.get("dataset", "cifar10"),
         "target_synset": target_synset,
         "target_name": target.get("name") or class_name(target_synset),
@@ -394,7 +571,10 @@ def _row(
         "architecture_profile": profile,
         "model_config_hash": resolved_model_hash,
         "seed": int(seeds["training_seed"]),
-        **{name: int(value) for name, value in seeds.items()},
+        **{
+            name: "" if value in {None, ""} else int(value)
+            for name, value in seeds.items()
+        },
         "training_protocol": training_protocol,
         "model_type": model_type,
         "sampler": sampler,
@@ -496,7 +676,12 @@ def rows_for_experiment(
         auxiliary_sets = target.get("auxiliary_sets") or cfg.get("auxiliary_sets", {})
         for n0_value in n0_values:
             n0 = int(n0_value)
-            for m_per_aux, k_aux, total_auxiliary_budget in _size_grid(exp_cfg, cfg, n0):
+            size_settings = _size_grid(exp_cfg, cfg, n0)
+            design_labels = {setting[3] for setting in size_settings}
+            baseline_design_label = (
+                next(iter(design_labels)) if len(design_labels) == 1 else "shared_across_designs"
+            )
+            for m_per_aux, k_aux, total_auxiliary_budget, design_label in size_settings:
                 for seeds in seed_records:
                     for protocol in protocols:
                         # A/C target-only baselines depend only on n0. Experiment
@@ -529,6 +714,7 @@ def rows_for_experiment(
                                     baseline_m,
                                     baseline_k,
                                     baseline_budget,
+                                    baseline_design_label,
                                     seeds,
                                     protocol,
                                     baseline_type,
@@ -554,6 +740,7 @@ def rows_for_experiment(
                                     m_per_aux,
                                     k_aux,
                                     total_auxiliary_budget,
+                                    design_label,
                                     seeds,
                                     protocol,
                                     model_type,
@@ -595,8 +782,10 @@ def rows_for_experiment(
         "readiness_validated_git_sha": str(gate.get("validated_git_sha", "")),
         "readiness_current_git_sha": str(gate.get("current_git_sha", "")),
     }
+    execution_fields = execution_grid_state(cfg, config_path)
     for row in rows:
         row.update(gate_fields)
+        row.update(execution_fields)
         row["resolved_run_spec_hash"] = compute_resolved_run_spec_hash(row)
         row["effective_run_spec_hash"] = row["resolved_run_spec_hash"]
         row["run_id"] = run_id_for_row(row)
@@ -613,6 +802,8 @@ def rows_for_experiment(
 def job_breakdown(rows: list[dict[str, Any]], cfg: Mapping[str, Any]) -> dict[str, Any]:
     dimensions = {
         "target": "target_synset",
+        "experiment": "experiment",
+        "design": "design_label",
         "protocol": "training_protocol",
         "model_type": "model_type",
         "n0": "n0",
@@ -627,16 +818,55 @@ def job_breakdown(rows: list[dict[str, Any]], cfg: Mapping[str, Any]) -> dict[st
     generated = int(cfg.get("num_generated", 64))
     image_size = int(cfg.get("image_size", 32))
     sample_bytes = len(rows) * generated * 3 * image_size * image_size * 4
+    checkpoints_per_job = 2
+    # Planning estimates include raw weights, EMA weights, and AdamW first/
+    # second moments.  Profile counts are deliberately rounded upward; exact
+    # parameter counts are recorded by preflight and every completed run.
+    profile_parameter_estimates = {
+        "legacy": 35_000_000,
+        "smoke_tiny": 2_000_000,
+        "pilot_small": 15_000_000,
+        "main_default": 40_000_000,
+        "capacity_large": 80_000_000,
+    }
+    checkpoint_state_bytes_per_parameter = 16
+    checkpoint_bytes = sum(
+        checkpoints_per_job
+        * profile_parameter_estimates.get(str(row.get("architecture_profile", "legacy")), 40_000_000)
+        * checkpoint_state_bytes_per_parameter
+        for row in rows
+    )
+    other_artifact_bytes = len(rows) * 5 * 1024**2
+    total_storage_bytes = checkpoint_bytes + sample_bytes + other_artifact_bytes
+    runtime_minutes = cfg.get("pilot_runtime_minutes_per_job")
     report: dict[str, Any] = {
+        "total_job_count": len(rows),
         "estimated_jobs": len(rows),
-        "estimated_checkpoints": 2 * len(rows),
+        "estimated_checkpoints": checkpoints_per_job * len(rows),
+        "estimated_generated_samples": generated * len(rows),
+        "estimated_checkpoint_storage_bytes": checkpoint_bytes,
+        "estimated_checkpoint_storage_gib": round(checkpoint_bytes / (1024**3), 3),
         "estimated_sample_storage_bytes": sample_bytes,
         "estimated_sample_storage_gib": round(sample_bytes / (1024**3), 3),
+        "estimated_other_artifact_storage_bytes": other_artifact_bytes,
+        "estimated_total_storage_bytes": total_storage_bytes,
+        "estimated_total_storage_gib": round(total_storage_bytes / (1024**3), 3),
+        "estimated_gpu_hours": (
+            round(len(rows) * float(runtime_minutes) / 60.0, 2)
+            if runtime_minutes is not None
+            else None
+        ),
+        "gpu_hour_estimate_status": "declared_runtime_estimate" if runtime_minutes is not None else "not_configured",
+        "planning_assumptions": {
+            "runtime_minutes_per_job": float(runtime_minutes) if runtime_minutes is not None else None,
+            "checkpoints_per_job": checkpoints_per_job,
+            "checkpoint_state_bytes_per_parameter": checkpoint_state_bytes_per_parameter,
+            "other_artifact_mebibytes_per_job": 5,
+            "sample_dtype_bytes": 4,
+            "profile_parameter_upper_estimates": profile_parameter_estimates,
+        },
         "breakdown": counts,
     }
-    runtime_minutes = cfg.get("pilot_runtime_minutes_per_job")
-    if runtime_minutes is not None:
-        report["estimated_gpu_hours"] = round(len(rows) * float(runtime_minutes) / 60.0, 2)
     return report
 
 
@@ -677,6 +907,11 @@ def main() -> None:
             )
         )
     report = job_breakdown(rows, cfg)
+    report["max_jobs_guard"] = {
+        "threshold": int(args.max_jobs),
+        "override_enabled": bool(args.allow_large_grid),
+        "within_limit": len(rows) <= int(args.max_jobs),
+    }
     print(json.dumps(report, indent=2, sort_keys=True))
     if len(rows) > args.max_jobs and not args.allow_large_grid:
         raise SystemExit(

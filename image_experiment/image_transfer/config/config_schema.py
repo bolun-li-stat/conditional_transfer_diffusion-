@@ -50,8 +50,11 @@ TOP_LEVEL_FIELDS = {
     "total_auxiliary_budget_values", "m_per_aux", "m_per_aux_rule", "num_aux_set_draws", "aux_draw_seed",
     "capacity_profiles", "model", "diffusion", "optimizer", "training", "sampling", "evaluation",
     "num_generated", "experiments", "experiments_to_run", "analysis_plan_path", "environment_lock_path",
+    "exact_environment_lock_path", "environment_runtime_report_path", "gpu_runtime_probe_path",
+    "resume_probe_path",
     "include_legacy_unconditional", "auxiliary_size_settings", "pilot_runtime_minutes_per_job",
     "metric_assets_manifest_path", "readiness_status_path", "readiness_pilot_config_path",
+    "dataset_identity_path",
     # Read-only compatibility keys removed from resolved output.
     "sampling_steps", "sampler", "data_split_seeds", "training_seed", "model_initialization_seed",
 }
@@ -68,13 +71,14 @@ OPTIMIZATION_PAIR_FIELDS = {"model_initialization_seed", "training_seed"}
 SECTION_FIELDS = {
     "data_split": {
         "manifest_root", "holdout_seed", "training_subset_seed", "data_split_seed", "target_eval_size",
-        "target_val_size", "auxiliary_eval_size", "nested_training_subsets", "eval_source",
+        "target_val_size", "auxiliary_eval_size", "target_similarity_reference_size",
+        "auxiliary_similarity_reference_size", "nested_training_subsets", "eval_source",
         "insufficient_data_action",
     },
     "training": {
         "protocol", "protocols", "steps", "batch_size", "target_batch_size", "auxiliary_batch_size",
         "auxiliary_loss_weight", "num_workers", "precision", "validation_interval", "checkpoint_interval",
-        "ema_decay", "max_grad_norm", "rolling_loss_window",
+        "ema_decay", "max_grad_norm", "rolling_loss_window", "minimum_gpu_headroom_bytes",
     },
     "sampling": {"sampler", "steps", "batch_size", "ddim_eta", "seed", "guidance_scale"},
     "diffusion": {"timesteps", "schedule", "prediction_type", "reverse_variance"},
@@ -258,6 +262,10 @@ def _canonicalize_aliases(config: dict[str, Any]) -> None:
             raise ValueError("Conflicting evaluation.eval_split and data_split.eval_source")
         split.setdefault("eval_source", legacy)
         warnings.warn("evaluation.eval_split is deprecated; use data_split.eval_source", DeprecationWarning, stacklevel=3)
+    if "data_split_seed" in split and config.get("seed_design"):
+        raise ValueError(
+            "data_split.data_split_seed is a legacy alias and cannot be combined with seed_design"
+        )
     if "data_split_seed" in split:
         legacy_seed = int(split.pop("data_split_seed"))
         if "holdout_seed" in split and int(split["holdout_seed"]) != legacy_seed:
@@ -267,8 +275,8 @@ def _canonicalize_aliases(config: dict[str, Any]) -> None:
         split.setdefault("holdout_seed", legacy_seed)
         split.setdefault("training_subset_seed", legacy_seed)
         warnings.warn("data_split_seed is deprecated; use holdout_seed and training_subset_seed", DeprecationWarning, stacklevel=3)
-    split.setdefault("holdout_seed", 0)
-    split.setdefault("training_subset_seed", 0)
+    split_holdout_was_explicit = "holdout_seed" in split
+    split_subset_was_explicit = "training_subset_seed" in split
 
     if "corruptions_per_image" in evaluation:
         legacy = int(evaluation.pop("corruptions_per_image"))
@@ -294,13 +302,26 @@ def _canonicalize_aliases(config: dict[str, Any]) -> None:
             )
         ):
             raise ValueError("seed_design cannot be combined with legacy seed fields")
-        if "holdout_seed" in seed_design and int(seed_design["holdout_seed"]) != int(split["holdout_seed"]):
+        if (
+            split_holdout_was_explicit
+            and "holdout_seed" in seed_design
+            and int(seed_design["holdout_seed"]) != int(split["holdout_seed"])
+        ):
             raise ValueError("Conflicting seed_design.holdout_seed and data_split.holdout_seed")
-        seed_design.setdefault("holdout_seed", int(split["holdout_seed"]))
+        seed_design.setdefault("holdout_seed", int(split.get("holdout_seed", 0)))
         split["holdout_seed"] = int(seed_design["holdout_seed"])
-        subset_seeds = [int(value) for value in seed_design.get("training_subset_seeds", [split["training_subset_seed"]])]
+        subset_seeds = [
+            int(value)
+            for value in seed_design.get(
+                "training_subset_seeds", [int(split.get("training_subset_seed", 0))]
+            )
+        ]
         if not subset_seeds:
             raise ValueError("seed_design.training_subset_seeds cannot be empty")
+        if split_subset_was_explicit and int(split["training_subset_seed"]) != int(subset_seeds[0]):
+            raise ValueError(
+                "Conflicting data_split.training_subset_seed and the first seed_design.training_subset_seeds value"
+            )
         seed_design["training_subset_seeds"] = subset_seeds
         pairs = list(seed_design.get("optimization_seed_pairs", [{"model_initialization_seed": 0, "training_seed": 0}]))
         if not pairs:
@@ -317,6 +338,31 @@ def _canonicalize_aliases(config: dict[str, Any]) -> None:
         # A list belongs only in seed_design.  This scalar is retained as the
         # default for direct, non-grid invocations.
         split["training_subset_seed"] = int(subset_seeds[0])
+    else:
+        split.setdefault("holdout_seed", 0)
+        split.setdefault("training_subset_seed", 0)
+    for field in (
+        "target_eval_size",
+        "target_val_size",
+        "auxiliary_eval_size",
+        "target_similarity_reference_size",
+        "auxiliary_similarity_reference_size",
+    ):
+        if field in split and int(split[field]) < 0:
+            raise ValueError(f"data_split.{field} must be non-negative")
+    training = config.setdefault("training", {})
+    if "minimum_gpu_headroom_bytes" in training and int(training["minimum_gpu_headroom_bytes"]) < 0:
+        raise ValueError("training.minimum_gpu_headroom_bytes must be non-negative")
+    evaluation = config.setdefault("evaluation", {})
+    if str(evaluation.get("mode")) == "strict" and bool(
+        evaluation.get("compute_feature_similarity", False)
+    ):
+        for field in ("target_similarity_reference_size", "auxiliary_similarity_reference_size"):
+            if int(split.get(field, 0)) <= 0:
+                raise ValueError(
+                    "Strict feature similarity requires positive "
+                    f"data_split.{field} for a dedicated reference split"
+                )
 
 
 def _validate_auxiliary_size_settings(config: Mapping[str, Any]) -> None:
@@ -325,7 +371,7 @@ def _validate_auxiliary_size_settings(config: Mapping[str, Any]) -> None:
         (f"experiments.{name}", value.get("auxiliary_size_settings"))
         for name, value in config.get("experiments", {}).items()
     )
-    allowed = {"K_aux", "m_per_aux", "auxiliary_ratio", "total_auxiliary_budget"}
+    allowed = {"K_aux", "m_per_aux", "auxiliary_ratio", "total_auxiliary_budget", "design_label"}
     for location, settings in locations:
         if settings is None:
             continue
@@ -345,6 +391,10 @@ def _validate_auxiliary_size_settings(config: Mapping[str, Any]) -> None:
             if len(size_fields) != 1:
                 raise ValueError(
                     f"{location}.auxiliary_size_settings[{index}] requires exactly one size field"
+                )
+            if "design_label" in setting and not str(setting["design_label"]).strip():
+                raise ValueError(
+                    f"{location}.auxiliary_size_settings[{index}].design_label cannot be empty"
                 )
 
 

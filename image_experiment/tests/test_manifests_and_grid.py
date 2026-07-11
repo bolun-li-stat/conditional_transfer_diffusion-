@@ -129,6 +129,48 @@ def test_v2_holdout_and_training_subset_randomness_are_separate():
     assert changed_holdout["target"]["eval"] != split["target"]["eval"]
 
 
+def test_similarity_reference_is_frozen_and_disjoint_from_all_study_splits():
+    split = build_split_manifest(
+        dataset_name="unit-images",
+        target_class="target",
+        holdout_seed=91,
+        train_pools={"target": list(range(50)), "near": list(range(100, 150))},
+        auxiliary_classes=["near"],
+        target_eval_size=6,
+        target_val_size=4,
+        auxiliary_eval_size=5,
+        target_similarity_reference_size=7,
+        auxiliary_similarity_reference_size=8,
+    )
+    target_parts = [
+        set(split["target"][key])
+        for key in ("train_candidate_pool", "validation", "eval", "similarity_reference")
+    ]
+    assert all(
+        not left & right
+        for index, left in enumerate(target_parts)
+        for right in target_parts[index + 1 :]
+    )
+    auxiliary = split["auxiliary"]["near"]
+    assert not set(auxiliary["train_candidate_pool"]) & set(auxiliary["eval_candidate_pool"])
+    assert not set(auxiliary["train_candidate_pool"]) & set(auxiliary["similarity_reference"])
+    assert not set(auxiliary["eval_candidate_pool"]) & set(auxiliary["similarity_reference"])
+    assert split["target_similarity_reference_hash"]
+    assert set(split["auxiliary_similarity_reference_hashes"]) == {"near"}
+
+    with pytest.raises(ManifestInsufficientDataError, match="similarity reference"):
+        build_split_manifest(
+            dataset_name="unit-images",
+            target_class="target",
+            holdout_seed=0,
+            train_pools={"target": list(range(10))},
+            target_eval_size=4,
+            target_val_size=4,
+            target_similarity_reference_size=3,
+            mode="strict",
+        )
+
+
 def test_legacy_data_split_seed_maps_to_both_v2_seeds_with_warning():
     with pytest.warns(DeprecationWarning, match="data_split_seed"):
         manifest = _manifest(data_split_seed=23)
@@ -201,6 +243,7 @@ def test_job_grid_has_full_ids_sweeps_and_no_aux_set_baseline_duplicates():
     # each target-only baseline is trained just once per protocol.
     assert len(rows) == 20
     assert len({row["run_id"] for row in rows}) == len(rows)
+    assert max(len(row["run_id"].encode("utf-8")) for row in rows) <= 180
     candidates = [row for row in rows if row["aux_set"] != "none"]
     assert {(row["m_per_aux"], row["K_aux"]) for row in candidates} == {
         (2, 1), (2, 2), (3, 1), (3, 2)
@@ -279,6 +322,8 @@ def test_training_eval_views_reuse_manifest_indices_and_are_deterministic(tmp_pa
             "target_eval_size": 4,
             "target_val_size": 2,
             "auxiliary_eval_size": 2,
+            "target_similarity_reference_size": 2,
+            "auxiliary_similarity_reference_size": 2,
             "eval_source": "train_holdout",
         },
         "evaluation": {"mode": "debug"},
@@ -304,6 +349,14 @@ def test_training_eval_views_reuse_manifest_indices_and_are_deterministic(tmp_pa
     assert bundle.target_training_subset_hash
     assert bundle.paired_target_prefix_hash == bundle.target_training_subset_hash
     assert set(bundle.auxiliary_training_subset_hashes) == {"cat"}
+    assert len(bundle.target_similarity_reference) == 2
+    assert len(bundle.auxiliary_similarity_reference_by_class["cat"]) == 2
+    assert bundle.target_similarity_reference_hash
+    assert set(bundle.auxiliary_similarity_reference_hashes) == {"cat"}
+    target_refs = bundle.split_manifest["target"]
+    assert not set(target_refs["similarity_reference"]) & set(target_refs["eval"])
+    assert not set(target_refs["similarity_reference"]) & set(target_refs["validation"])
+    assert not set(target_refs["similarity_reference"]) & set(target_refs["train_candidate_pool"])
     assert Path(bundle.split_manifest_path).exists()
     assert Path(bundle.subset_manifest_path).exists()
     assert bundle.target_train.dataset.indices == bundle.target_train_eval.dataset.indices
@@ -347,6 +400,31 @@ def test_config_alias_resolution_conflicts_and_unknown_fields():
     with pytest.raises(ValueError, match="Unknown top-level"):
         resolve_config({**raw, "silently_ignored": True})
 
+    legacy_mixed_with_v2 = copy.deepcopy(raw)
+    legacy_mixed_with_v2["data_split"] = {"data_split_seed": 100}
+    legacy_mixed_with_v2["seed_design"] = {
+        "holdout_seed": 100,
+        "training_subset_seeds": [0, 1],
+    }
+    with pytest.raises(ValueError, match="legacy alias"):
+        resolve_config(legacy_mixed_with_v2)
+
+    missing_similarity_reference = copy.deepcopy(raw)
+    missing_similarity_reference["evaluation"] = {
+        "mode": "strict",
+        "compute_feature_similarity": True,
+    }
+    with pytest.raises(ValueError, match="dedicated reference split"):
+        resolve_config(missing_similarity_reference)
+
+
+def test_config_rejects_negative_gpu_headroom_requirement():
+    raw = _grid_config()
+    raw["training"]["minimum_gpu_headroom_bytes"] = -1
+    with pytest.warns(DeprecationWarning, match="data_split_seed"):
+        with pytest.raises(ValueError, match="minimum_gpu_headroom_bytes must be non-negative"):
+            resolve_config(raw)
+
 
 def test_disabled_experiment_guard_and_release_pilot_grid_identity():
     disabled = _grid_config()
@@ -367,13 +445,19 @@ def test_disabled_experiment_guard_and_release_pilot_grid_identity():
         "conditional_target_only_n0", "conditional_close", "conditional_far",
     }
     assert len({row["run_id"] for row in rows}) == len(rows)
+    assert max(len(row["run_id"].encode("utf-8")) for row in rows) <= 180
     required = {
         "architecture", "architecture_profile", "model_config_hash", "holdout_seed",
         "training_subset_seed", "split_manifest_key", "subset_manifest_key", "target_set_hash",
-        "environment_lock_hash", "resolved_run_spec_hash",
+        "environment_lock_hash", "exact_environment_lock_hash", "exact_environment_lock_status",
+        "resolved_run_spec_hash",
     }
     assert all(required <= set(row) for row in rows)
     assert {row["architecture"] for row in rows} == {"adm_unet"}
     assert {row["architecture_profile"] for row in rows} == {"main_default"}
     assert {row["holdout_seed"] for row in rows} == {100}
     assert {row["training_subset_seed"] for row in rows} == {0, 1}
+    assert {row["data_split_seed"] for row in rows} == {""}
+    assert {row["dataset_identity_status"] for row in rows} == {"unresolved_strict"}
+    assert {row["exact_environment_lock_status"] for row in rows} == {"unresolved_strict"}
+    assert {row["runnable"] for row in rows} == {False}

@@ -17,9 +17,12 @@ from torch.utils.data import ConcatDataset, DataLoader
 
 from image_transfer.config import load_resolved_config
 from image_transfer.data import (
+    DatasetIdentityError,
     ManifestInsufficientDataError,
     build_datasets_for_job,
     canonical_sha256,
+    load_dataset_identity,
+    resolve_manifest_seeds,
     target_training_subset,
 )
 from image_transfer.diffusion import ImageDDIM, ImageDDPM
@@ -51,18 +54,21 @@ from image_transfer.scripts.make_job_grid import (
     EXP_DIR,
     compute_manifest_keys,
     compute_resolved_run_spec_hash,
+    execution_grid_state,
     run_id_for_row,
 )
-from image_transfer.scripts.inspect_environment import inspect_environment
+from image_transfer.scripts.inspect_environment import file_sha256, inspect_environment, validate_environment_report
 from image_transfer.scripts.prepare_metric_assets import verify_manifest
 from image_transfer.training.checkpointing import load_checkpoint
 from image_transfer.training.trainer import train_image_model
 from image_transfer.utils.device import get_device
 from image_transfer.utils.io import (
+    atomic_write_text,
     ensure_dir,
     failure_result_path,
     get_git_sha,
     load_valid_result,
+    load_json,
     resolve_env_path,
     run_result_path,
     write_run_result,
@@ -73,7 +79,7 @@ from image_transfer.utils.seed import make_torch_generator
 # Retained for old imports. Results are no longer appended to shared CSV files;
 # aggregation discovers schema-valid per-run JSON records instead.
 FIELDS = [
-    "run_id", "status", "dataset", "experiment", "target_synset", "model_type", "aux_set",
+    "run_id", "status", "dataset", "experiment", "design_label", "target_synset", "model_type", "aux_set",
     "n0", "m_per_aux", "K_aux", "training_protocol", "data_split_seed",
     "model_initialization_seed", "training_seed", "sampling_seed", "evaluation_seed",
     "manifest_hash", "target_training_subset_hash", "optimizer_steps", "target_examples_seen",
@@ -360,19 +366,54 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
         raise ValueError("--force and --resume are mutually exclusive")
     resolved_info = load_resolved_config(args.config)
     cfg = resolved_info.resolved
-    lock_path = _config_relative_path(
+    execution_fields = execution_grid_state(cfg, args.config)
+    for field, expected in execution_fields.items():
+        recorded = (job or {}).get(field)
+        if recorded in {None, ""}:
+            continue
+        if field == "runnable":
+            if _boolean_value(recorded) != bool(expected):
+                raise ValueError(f"job grid {field} no longer matches the current execution identity")
+        elif str(recorded) != str(expected):
+            raise ValueError(f"job grid {field} no longer matches the current execution identity")
+    if not bool(execution_fields["runnable"]):
+        raise DatasetIdentityError(
+            "This job is an unresolved shape-only grid row and cannot execute: "
+            + str(execution_fields.get("runnable_reason", "execution identity is unresolved"))
+        )
+    source_lock_path = _config_relative_path(
         cfg.get("environment_lock_path", "../../environment/requirements-image-lock.txt"),
         args.config,
     )
-    environment_report = inspect_environment(lock_path)
-    if environment_report["environment_lock_hash"] != resolved_info.environment_lock_hash:
-        raise RuntimeError("runtime environment lock does not match the resolved configuration")
-    if not bool(environment_report.get("lock_matches_runtime", False)):
+    exact_lock_path = _config_relative_path(
+        cfg.get("exact_environment_lock_path", source_lock_path),
+        args.config,
+    )
+    runtime_report_value = cfg.get("environment_runtime_report_path")
+    if runtime_report_value:
+        environment_report = load_json(_config_relative_path(runtime_report_value, args.config))
+        validate_environment_report(environment_report)
+    else:
+        environment_report = inspect_environment(exact_lock_path, source_spec_path=source_lock_path)
+    if environment_report["source_environment_spec_hash"] != resolved_info.environment_lock_hash:
+        raise RuntimeError("runtime environment source specification does not match the resolved configuration")
+    configured_exact_hash = str(execution_fields.get("exact_environment_lock_hash", ""))
+    if configured_exact_hash and environment_report.get("environment_lock_hash") != configured_exact_hash:
+        raise RuntimeError("runtime exact environment lock does not match the resolved configuration")
+    if str(cfg.get("evaluation", {}).get("mode")) == "strict" and not bool(
+        environment_report.get("exact_environment_lock", False)
+    ):
+        raise RuntimeError("strict runs require a frozen exact environment lock")
+    if (
+        str(cfg.get("evaluation", {}).get("mode")) == "strict"
+        and not bool(environment_report.get("lock_matches_runtime", False))
+    ):
         raise RuntimeError(
             "runtime packages do not match the selected environment definition: "
             + "; ".join(environment_report.get("lock_mismatches", []))
         )
     environment_runtime_hash = str(environment_report.get("environment_runtime_hash", ""))
+    environment_report_hash = str(environment_report.get("environment_report_hash", ""))
     git_sha = get_git_sha()
     job_requests_override = _boolean_value((job or {}).get("readiness_gate_override"))
     cli_requests_override = bool(getattr(args, "override_readiness_gate", False))
@@ -425,10 +466,10 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
     evaluation_cfg = cfg.get("evaluation", {})
     seed_design = cfg.get("seed_design", {})
     default_pair = (seed_design.get("optimization_seed_pairs") or [{}])[0]
-    holdout_seed = int(
+    requested_holdout_seed = int(
         _arg_or_job(args, job, "holdout_seed", seed_design.get("holdout_seed", split_cfg.get("holdout_seed", legacy_seed)))
     )
-    training_subset_seed = int(
+    requested_training_subset_seed = int(
         _arg_or_job(
             args,
             job,
@@ -436,9 +477,17 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
             (seed_design.get("training_subset_seeds") or [split_cfg.get("training_subset_seed", legacy_seed)])[0],
         )
     )
-    # Compatibility for builders and old result readers.  In new jobs this is
-    # the fixed holdout seed, never the variable training-subset seed.
-    data_split_seed = int(_arg_or_job(args, job, "data_split_seed", holdout_seed))
+    legacy_data_split_seed = _arg_or_job(args, job, "data_split_seed", None)
+    holdout_seed, training_subset_seed = resolve_manifest_seeds(
+        holdout_seed=requested_holdout_seed,
+        training_subset_seed=requested_training_subset_seed,
+        data_split_seed=(
+            None if legacy_data_split_seed in {None, ""} else int(legacy_data_split_seed)
+        ),
+    )
+    data_split_seed: int | str = (
+        "" if legacy_data_split_seed in {None, ""} else int(legacy_data_split_seed)
+    )
     model_initialization_seed = int(
         _arg_or_job(args, job, "model_initialization_seed", default_pair.get("model_initialization_seed", legacy_seed))
     )
@@ -455,6 +504,7 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
     k_aux = int(_arg_or_job(args, job, "K_aux", cfg.get("K_aux", 5)))
     model_type = str(_arg_or_job(args, job, "model_type", "unconditional_n0"))
     aux_set = str(_arg_or_job(args, job, "aux_set", "none"))
+    design_label = str(_arg_or_job(args, job, "design_label", "legacy_unspecified"))
     aux_draw_id = str(_arg_or_job(args, job, "aux_draw_id", "none"))
     target = cfg.get("targets", [{"synset": "dog", "name": "dog"}])[0]
     target_synset = str(_arg_or_job(args, job, "target_synset", target.get("synset", "dog")))
@@ -491,11 +541,11 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
             "training_subset_seed": training_subset_seed,
         },
     )
-
     job_fields: dict[str, Any] = {
         "dataset": cfg.get("dataset", "cifar10"),
         "experiment": experiment,
         "experiment_name": {"A": "equal_target", "B": "equal_total", "C": "similarity_sweep"}[experiment],
+        "design_label": design_label,
         "target_synset": target_synset,
         "target_name": target_name,
         "model_type": model_type,
@@ -540,6 +590,7 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
         "study_plan_hash": resolved_info.study_plan_hash,
         "target_set_hash": resolved_info.target_set_hash,
         "environment_lock_hash": resolved_info.environment_lock_hash,
+        **execution_fields,
         **readiness_fields,
         "split_manifest_key": split_manifest_key,
         "subset_manifest_key": subset_manifest_key,
@@ -558,15 +609,6 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
     outdir = Path((job or {}).get("output_dir") or results_root / EXP_DIR[experiment])
     result_path = run_result_path(results_root, run_id)
 
-    if result_path.exists() and not getattr(args, "force", False):
-        try:
-            existing = load_valid_result(result_path, expected_run_id=run_id)
-        except (OSError, ValueError):
-            pass
-        else:
-            print(f"skipped completed run: {result_path}")
-            return existing
-
     checkpoint_dir = outdir / "checkpoints"
     last_checkpoint_path = checkpoint_dir / f"{run_id}_last.pt"
     best_checkpoint_path = checkpoint_dir / f"{run_id}_best.pt"
@@ -580,31 +622,22 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
         return preview
 
     failure_path = failure_result_path(results_root, run_id)
-    if getattr(args, "force", False) and not getattr(args, "resume", False):
-        for stale_path in (
-            result_path,
-            failure_path,
-            last_checkpoint_path,
-            best_checkpoint_path,
-            train_log_path,
-            sample_path,
-            run_config_path,
-        ):
-            stale_path.unlink(missing_ok=True)
-    elif not getattr(args, "resume", False) and (last_checkpoint_path.exists() or best_checkpoint_path.exists()):
-        raise FileExistsError(
-            f"incomplete checkpoint artifacts exist for {run_id}; pass --resume to continue or --force to restart"
-        )
-
     builder_job = dict(job or {})
     builder_job.update({
         "experiment": experiment,
         "target_synset": target_synset,
         "model_type": model_type,
-        "data_split_seed": data_split_seed,
         "holdout_seed": holdout_seed,
         "training_subset_seed": training_subset_seed,
     })
+    if data_split_seed != "":
+        builder_job["data_split_seed"] = data_split_seed
+    else:
+        builder_job.pop("data_split_seed", None)
+    dataset_identity_path = str(execution_fields.get("dataset_identity_path", ""))
+    verified_dataset_identity = None
+    if dataset_identity_path:
+        verified_dataset_identity = load_dataset_identity(dataset_identity_path)
     try:
         bundle = build_datasets_for_job(
             cfg,
@@ -614,6 +647,8 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
             k_aux=k_aux,
             seed=training_seed,
             model_type=model_type,
+            dataset_identity=verified_dataset_identity,
+            dataset_identity_path=dataset_identity_path,
         )
     except ManifestInsufficientDataError as exception:
         exp_cfg = cfg.get("experiments", {}).get(experiment, {})
@@ -645,6 +680,9 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
                 "environment_lock_hash": resolved_info.environment_lock_hash,
                 "environment_runtime_hash": environment_runtime_hash,
                 "environment_report": environment_report,
+                "dataset_identity_path": execution_fields.get("dataset_identity_path", ""),
+                "dataset_identity_hash": execution_fields.get("dataset_identity_hash", ""),
+                "dataset_content_hash": execution_fields.get("dataset_content_hash", ""),
                 "readiness_gate": readiness_gate,
                 **readiness_fields,
             },
@@ -652,25 +690,6 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
         failure_path.unlink(missing_ok=True)
         print(f"skipped {run_id}: insufficient target images after fixed holdouts")
         return record
-
-    ensure_dir(run_config_path.parent)
-    with open(run_config_path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(
-            {
-                "raw_config": resolved_info.raw,
-                "resolved_config": cfg,
-                "environment_report": environment_report,
-                "readiness_gate": readiness_gate,
-                **readiness_fields,
-                **resolved_info.provenance(),
-                "resolved_model_config": resolved_model_config,
-                "model_config_hash": resolved_model_hash,
-                "job": builder_job,
-                "run_id": run_id,
-            },
-            handle,
-            sort_keys=False,
-        )
 
     target_subset_count = n0 + k_aux * m_per_aux if model_type in EQUAL_TOTAL_MODEL_TYPES else n0
     legacy_target_subset_hash = canonical_sha256(target_training_subset(bundle.manifest, target_subset_count))
@@ -689,6 +708,71 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
         or bundle.manifest.get("target_training_subset_hash", "")
         or legacy_target_subset_hash
     )
+
+    expected_data_metadata: dict[str, Any] = {
+        "dataset_identity_hash": bundle.dataset_identity_hash,
+        "dataset_content_hash": bundle.dataset_content_hash,
+        "dataset_fingerprint": bundle.split_manifest.get("dataset_fingerprint"),
+        "split_manifest_hash": split_manifest_hash,
+        "subset_manifest_hash": subset_manifest_hash,
+        "target_training_subset_hash": target_subset_hash,
+        "target_eval_indices_hash": bundle.target_eval_indices_hash,
+        "target_validation_indices_hash": bundle.target_validation_indices_hash,
+        "target_similarity_reference_hash": bundle.target_similarity_reference_hash,
+        "auxiliary_training_subset_hashes": bundle.auxiliary_training_subset_hashes,
+        "auxiliary_similarity_reference_hashes": bundle.auxiliary_similarity_reference_hashes,
+    }
+    if result_path.exists() and not getattr(args, "force", False):
+        try:
+            existing = load_valid_result(result_path, expected_run_id=run_id)
+        except (OSError, ValueError):
+            existing = None
+        if existing is not None:
+            metadata = existing.get("metadata", {})
+            mismatches = [
+                field
+                for field, expected in expected_data_metadata.items()
+                if metadata.get(field) != expected
+            ]
+            if mismatches:
+                raise RuntimeError(
+                    "Completed result cannot be reused because current dataset/manifests differ in: "
+                    + ", ".join(mismatches)
+                    + "; review the change and use --force to rerun"
+                )
+            print(f"skipped completed run after dataset identity verification: {result_path}")
+            return existing
+
+    if getattr(args, "force", False) and not getattr(args, "resume", False):
+        for stale_path in (
+            result_path,
+            failure_path,
+            last_checkpoint_path,
+            best_checkpoint_path,
+            train_log_path,
+            sample_path,
+            run_config_path,
+        ):
+            stale_path.unlink(missing_ok=True)
+    elif not getattr(args, "resume", False) and (last_checkpoint_path.exists() or best_checkpoint_path.exists()):
+        raise FileExistsError(
+            f"incomplete checkpoint artifacts exist for {run_id}; pass --resume to continue or --force to restart"
+        )
+
+    run_config_payload = {
+        "raw_config": resolved_info.raw,
+        "resolved_config": cfg,
+        "environment_report": environment_report,
+        "readiness_gate": readiness_gate,
+        **readiness_fields,
+        **resolved_info.provenance(),
+        "resolved_model_config": resolved_model_config,
+        "model_config_hash": resolved_model_hash,
+        "dataset_identity": bundle.dataset_identity,
+        "job": builder_job,
+        "run_id": run_id,
+    }
+    atomic_write_text(yaml.safe_dump(run_config_payload, sort_keys=False), run_config_path)
 
     timesteps = int(cfg.get("diffusion", {}).get("timesteps", 1000))
     schedule = str(cfg.get("diffusion", {}).get("schedule", "linear"))
@@ -858,6 +942,7 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
             "target_set_hash": resolved_info.target_set_hash,
             "environment_lock_hash": resolved_info.environment_lock_hash,
             "environment_runtime_hash": environment_runtime_hash,
+            "environment_report_hash": environment_report_hash,
             "environment_report": environment_report,
             "readiness_gate": readiness_gate,
             **readiness_fields,
@@ -985,10 +1070,13 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
         if compute_similarity or compute_neighbors
         else None
     )
-    if compute_similarity and bundle.aux_eval_datasets:
+    similarity_auxiliary_datasets = list(
+        getattr(bundle, "auxiliary_similarity_reference_by_class", {}).values()
+    )
+    if compute_similarity and bundle.target_similarity_reference is not None and similarity_auxiliary_datasets:
         average_similarity = average_auxiliary_similarity(
-            bundle.target_eval,
-            bundle.aux_eval_datasets,
+            bundle.target_similarity_reference,
+            similarity_auxiliary_datasets,
             batch_size=int(evaluation_cfg.get("feature_batch_size", batch_size)),
             device=device,
             extractor=shared_diagnostic_extractor,
@@ -996,9 +1084,20 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
         )
     else:
         average_similarity = float("nan")
+    selected_similarity_reference_hashes = {
+        label: bundle.auxiliary_similarity_reference_hashes[label]
+        for label in bundle.aux_synsets
+        if label in bundle.auxiliary_similarity_reference_hashes
+    }
+    similarity_metric_reference_hash = canonical_sha256({
+        "split": "dedicated_similarity_reference",
+        "target": bundle.target_similarity_reference_hash,
+        "auxiliary": selected_similarity_reference_hashes,
+    })
 
     memorization_metrics: dict[str, Any] = {}
     nearest_neighbor_grid_path = ""
+    nearest_neighbor_grid_hash = ""
     if compute_neighbors:
         reference_limit_value = evaluation_cfg.get("nearest_neighbor_reference_max")
         reference_limit = None if reference_limit_value is None else int(reference_limit_value)
@@ -1092,6 +1191,7 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
             extractor=shared_diagnostic_extractor,
             strict_feature_extractor=mode == "strict",
         )
+        nearest_neighbor_grid_hash = file_sha256(nearest_neighbor_grid_path)
 
     train_mse = train_diagnostic_metrics.get("train_epsilon_mse_target")
     validation_mse = selected_validation_metrics.get("validation_epsilon_mse_target")
@@ -1126,6 +1226,9 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
             getattr(bundle, "split_manifest", {}).get("dataset_fingerprint")
             or bundle.manifest.get("dataset_fingerprint")
         ),
+        "dataset_identity_path": bundle.dataset_identity_path,
+        "dataset_identity_hash": bundle.dataset_identity_hash,
+        "dataset_content_hash": bundle.dataset_content_hash,
         "target_training_subset_hash": target_subset_hash,
         "paired_target_prefix_hash": str(getattr(bundle, "paired_target_prefix_hash", target_subset_hash)),
         "target_eval_indices_hash": str(
@@ -1142,6 +1245,15 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
         "auxiliary_training_subset_hashes_json": json.dumps(
             getattr(bundle, "auxiliary_training_subset_hashes", {}), sort_keys=True
         ),
+        "target_similarity_reference_hash": bundle.target_similarity_reference_hash,
+        "auxiliary_similarity_reference_hashes": dict(
+            bundle.auxiliary_similarity_reference_hashes
+        ),
+        "auxiliary_similarity_reference_hashes_json": json.dumps(
+            bundle.auxiliary_similarity_reference_hashes, sort_keys=True
+        ),
+        "selected_auxiliary_similarity_reference_hashes": selected_similarity_reference_hashes,
+        "similarity_metric_reference_hash": similarity_metric_reference_hash,
         "total_train_images": bundle.total_train_images,
         "num_target_available_after_holdouts": bundle.num_target_available,
         "equal_total_feasibility_json": json.dumps(bundle.feasibility, sort_keys=True),
@@ -1162,6 +1274,7 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
         "target_set_hash": resolved_info.target_set_hash,
         "environment_lock_hash": resolved_info.environment_lock_hash,
         "environment_runtime_hash": environment_runtime_hash,
+        "environment_report_hash": environment_report_hash,
         "environment_report": environment_report,
         "readiness_gate": readiness_gate,
         **readiness_fields,
@@ -1187,6 +1300,7 @@ def run(args, job: dict[str, Any] | None = None) -> dict[str, Any]:
         "sample_path": str(sample_path),
         "run_config_path": str(run_config_path),
         "nearest_neighbor_grid_path": nearest_neighbor_grid_path,
+        "nearest_neighbor_grid_hash": nearest_neighbor_grid_hash,
         "diagnostic_feature_extractor": (
             getattr(shared_diagnostic_extractor, "extractor_name", type(shared_diagnostic_extractor).__name__)
             if shared_diagnostic_extractor is not None

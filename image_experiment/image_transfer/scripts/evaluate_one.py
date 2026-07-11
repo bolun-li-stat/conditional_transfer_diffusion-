@@ -8,12 +8,14 @@ from pathlib import Path
 
 import torch
 
-from image_transfer.data import build_datasets_for_job
+from image_transfer.config import load_resolved_config
+from image_transfer.data import DatasetIdentityError, build_datasets_for_job, load_dataset_identity
 from image_transfer.evaluation.classifier_fidelity import evaluate_classifier_fidelity
 from image_transfer.evaluation.feature_metrics import compute_feature_metrics
 from image_transfer.scripts.train_one import _collect_dataset, _disabled_classifier_metrics
+from image_transfer.scripts.make_job_grid import dataset_identity_grid_state
 from image_transfer.utils.device import get_device
-from image_transfer.utils.io import atomic_write_json, load_yaml
+from image_transfer.utils.io import atomic_write_json
 
 
 def _load_tensor(path: str | Path) -> torch.Tensor:
@@ -46,7 +48,7 @@ def main() -> None:
     parser.add_argument("--mode", choices=["strict", "debug"])
     args = parser.parse_args()
 
-    cfg = load_yaml(args.config)
+    cfg = load_resolved_config(args.config).resolved
     evaluation_cfg = cfg.get("evaluation", {})
     samples = _load_tensor(args.samples)
     job = {
@@ -61,6 +63,11 @@ def main() -> None:
         job["holdout_seed"] = args.holdout_seed
     if args.training_subset_seed is not None:
         job["training_subset_seed"] = args.training_subset_seed
+    identity_fields = dataset_identity_grid_state(cfg, args.config)
+    if not bool(identity_fields["runnable"]):
+        raise DatasetIdentityError(str(identity_fields.get("runnable_reason", "dataset identity is unresolved")))
+    identity_path = str(identity_fields.get("dataset_identity_path", ""))
+    identity = load_dataset_identity(identity_path) if identity_path else None
     bundle = build_datasets_for_job(
         cfg,
         job,
@@ -69,6 +76,8 @@ def main() -> None:
         k_aux=args.K_aux,
         seed=int(args.data_split_seed if args.data_split_seed is not None else (args.holdout_seed or 0)),
         model_type=args.model_type,
+        dataset_identity=identity,
+        dataset_identity_path=identity_path,
     )
     real_limit = evaluation_cfg.get("real_eval_max")
     real = _collect_dataset(
@@ -118,6 +127,8 @@ def main() -> None:
         "split_manifest_path": bundle.split_manifest_path,
         "subset_manifest_path": bundle.subset_manifest_path,
         "target_eval_indices_hash": bundle.target_eval_indices_hash,
+        "dataset_identity_hash": bundle.dataset_identity_hash,
+        "dataset_content_hash": bundle.dataset_content_hash,
         "target_synset": args.target_synset,
         "model_type": args.model_type,
         "aux_synsets_json": json.dumps(bundle.aux_synsets),
