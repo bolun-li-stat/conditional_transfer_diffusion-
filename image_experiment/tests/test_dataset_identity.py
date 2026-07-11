@@ -58,4 +58,3 @@ def test_identity_requires_coverage_for_every_configured_class(tmp_path: Path):
     (target / "image.bin").write_bytes(b"target")
     with pytest.raises(DatasetIdentityError, match="no training files"):
         freeze_dataset_identity(_config(tmp_path), tmp_path / "identity.json")
-
