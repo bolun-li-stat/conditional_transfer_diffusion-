@@ -12,7 +12,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from image_transfer.scripts.aggregate_results import aggregate_results, t95_confidence_interval
+from image_transfer.scripts.aggregate_results import (
+    aggregate_results,
+    hierarchical_target_bootstrap,
+    summarize_by_target,
+    summarize_by_training_subset,
+    t95_confidence_interval,
+)
 
 EXP_DIR = {"A": "A_equal_target", "B": "B_equal_total", "C": "C_similarity_sweep"}
 TRANSFER_METRICS = [
@@ -55,6 +61,39 @@ def _plot_summary(frame: pd.DataFrame, x_column: str, identity_columns: list[str
     return pd.DataFrame(rows)
 
 
+def _nested_plot_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    """Create plot estimates at the subset/target hierarchy, never per raw run."""
+
+    if frame.empty:
+        return pd.DataFrame()
+    prepared = frame.copy()
+    defaults = {
+        "target_synset": "single_target_scope",
+        "split_manifest_hash": "untracked_split",
+        "subset_manifest_hash": "untracked_subset",
+        "holdout_seed": 0,
+        "training_subset_seed": 0,
+        "model_initialization_seed": 0,
+        "training_seed": 0,
+        "aux_draw_id": "none",
+        "aux_composition": "[]",
+        "baseline_run_id": "untracked_baseline",
+    }
+    for name, value in defaults.items():
+        if name not in prepared:
+            prepared[name] = value
+    subsets = summarize_by_training_subset(prepared)
+    targets = summarize_by_target(subsets)
+    hierarchical = hierarchical_target_bootstrap(subsets)
+    if (
+        not hierarchical.empty
+        and "hierarchical_status" in hierarchical
+        and hierarchical["hierarchical_status"].eq("available").all()
+    ):
+        return hierarchical
+    return targets
+
+
 def _plot_paired_axis(
     ax,
     pairs: pd.DataFrame,
@@ -82,8 +121,14 @@ def _plot_paired_axis(
         else ("model_type", "aux_set", "training_protocol", "baseline_kind", *conditioning)
     )
     identity_columns = [column for column in identity_candidates if column in frame]
-    summary = _plot_summary(frame, x_column, identity_columns)
-    for identity, group in frame.groupby(identity_columns, dropna=False):
+    summary = _nested_plot_summary(frame)
+    if summary.empty:
+        return summary
+    if summary.get("summary_type", pd.Series(dtype=str)).eq("target_conditional").any():
+        identity_columns = list(dict.fromkeys([*identity_columns, "target_synset"]))
+    for identity, group in frame.groupby(
+        [column for column in identity_columns if column in frame], dropna=False
+    ):
         identity = identity if isinstance(identity, tuple) else (identity,)
         label = " | ".join(str(value) for value in identity)
         aggregate = summary
@@ -96,7 +141,7 @@ def _plot_paired_axis(
                 group["improvement_positive"],
                 s=16,
                 alpha=0.22,
-                label=f"{label} raw",
+                label=f"{label} run-level audit points",
             )
         means = pd.to_numeric(aggregate["mean"], errors="coerce").to_numpy(dtype=float)
         lower = pd.to_numeric(aggregate["ci95_lower"], errors="coerce").to_numpy(dtype=float)
@@ -112,7 +157,7 @@ def _plot_paired_axis(
             marker="o",
             capsize=3,
             linewidth=1.5,
-            label=f"{label} mean (95% t CI)",
+            label=f"{label} nested mean (95% interval)",
         )
     ax.axhline(0.0, color="black", linewidth=1.0)
     ax.set_xlabel(x_column)
@@ -154,20 +199,35 @@ def _plot_noise_bins(metrics: pd.DataFrame, figdir: Path) -> Path | None:
     available = [column for column in NOISE_BINS if column in metrics]
     if metrics.empty or not available:
         return None
-    identity_columns = [
-        column
-        for column in ("experiment", "target_synset", "model_type", "training_protocol", "n0", "m_per_aux", "K_aux")
-        if column in metrics
-    ]
-    rows = []
-    for identity, group in metrics.groupby(identity_columns, dropna=False):
-        identity = identity if isinstance(identity, tuple) else (identity,)
-        for column in available:
-            stats = t95_confidence_interval(pd.to_numeric(group[column], errors="coerce").tolist())
-            rows.append({**dict(zip(identity_columns, identity)), "noise_bin": column, **stats})
-    summary = pd.DataFrame(rows)
+    summaries = []
+    for column in available:
+        prepared = metrics.copy()
+        prepared["metric"] = column
+        prepared["pair_status"] = "completed"
+        prepared["baseline_kind"] = "absolute_metric"
+        prepared["baseline_model_type"] = "not_applicable"
+        prepared["improvement_positive"] = pd.to_numeric(prepared[column], errors="coerce")
+        prepared = prepared.dropna(subset=["improvement_positive"])
+        nested = _nested_plot_summary(prepared)
+        if not nested.empty:
+            nested["noise_bin"] = column
+            summaries.append(nested)
+    summary = pd.concat(summaries, ignore_index=True, sort=False) if summaries else pd.DataFrame()
     if summary.empty:
         return None
+    identity_columns = [
+        column
+        for column in (
+            "experiment",
+            "target_synset" if summary.get("summary_type", pd.Series(dtype=str)).eq("target_conditional").any() else None,
+            "model_type",
+            "training_protocol",
+            "n0",
+            "m_per_aux",
+            "K_aux",
+        )
+        if column is not None and column in summary
+    ]
     figure, axis = plt.subplots(figsize=(9, 4.5))
     labels = [" | ".join(str(row[column]) for column in identity_columns) for _, row in summary.drop_duplicates(identity_columns).iterrows()]
     x = np.arange(len(available), dtype=float)
@@ -182,7 +242,7 @@ def _plot_noise_bins(metrics: pd.DataFrame, figdir: Path) -> Path | None:
         error[~np.isfinite(error)] = 0.0
         axis.bar(x + (index - (len(labels) - 1) / 2) * width, means, width, yerr=error, capsize=2, label=" | ".join(map(str, identity)))
     axis.set_xticks(x, [name.replace("test_epsilon_mse_", "").replace("_noise", "") for name in available])
-    axis.set_ylabel("target epsilon MSE (mean, 95% t CI)")
+    axis.set_ylabel("target epsilon MSE (nested mean, 95% interval)")
     axis.legend(fontsize=6)
     figure.tight_layout()
     output = figdir / "target_denoising_mse_by_noise_bin.png"

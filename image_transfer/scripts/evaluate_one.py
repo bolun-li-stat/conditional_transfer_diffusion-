@@ -37,7 +37,9 @@ def main() -> None:
     parser.add_argument("--n0", type=int, required=True)
     parser.add_argument("--m-per-aux", type=int, default=0)
     parser.add_argument("--K-aux", type=int, default=0, dest="K_aux")
-    parser.add_argument("--data-split-seed", type=int, default=0)
+    parser.add_argument("--data-split-seed", type=int)
+    parser.add_argument("--holdout-seed", type=int)
+    parser.add_argument("--training-subset-seed", type=int)
     parser.add_argument("--evaluation-seed", type=int, default=0)
     parser.add_argument("--aux-composition", default="[]")
     parser.add_argument("--device", default="auto")
@@ -52,15 +54,20 @@ def main() -> None:
         "target_synset": args.target_synset,
         "aux_composition": args.aux_composition,
         "model_type": args.model_type,
-        "data_split_seed": args.data_split_seed,
     }
+    if args.data_split_seed is not None:
+        job["data_split_seed"] = args.data_split_seed
+    if args.holdout_seed is not None:
+        job["holdout_seed"] = args.holdout_seed
+    if args.training_subset_seed is not None:
+        job["training_subset_seed"] = args.training_subset_seed
     bundle = build_datasets_for_job(
         cfg,
         job,
         n0=args.n0,
         m_per_aux=args.m_per_aux,
         k_aux=args.K_aux,
-        seed=args.data_split_seed,
+        seed=int(args.data_split_seed if args.data_split_seed is not None else (args.holdout_seed or 0)),
         model_type=args.model_type,
     )
     real_limit = evaluation_cfg.get("real_eval_max")
@@ -75,7 +82,7 @@ def main() -> None:
         samples,
         real,
         mode=mode,
-        real_manifest_hash=bundle.manifest_hash,
+        real_manifest_hash=bundle.split_manifest_hash,
         cache_dir=Path(args.out_metrics).parent / "real_feature_cache",
         compute_fid=bool(evaluation_cfg.get("compute_fid", evaluation_cfg.get("compute_fid_kid", True))),
         compute_kid=bool(evaluation_cfg.get("compute_kid", evaluation_cfg.get("compute_fid_kid", True))),
@@ -106,6 +113,11 @@ def main() -> None:
         "samples_path": str(args.samples),
         "manifest_hash": bundle.manifest_hash,
         "manifest_path": bundle.manifest_path,
+        "split_manifest_hash": bundle.split_manifest_hash,
+        "subset_manifest_hash": bundle.subset_manifest_hash,
+        "split_manifest_path": bundle.split_manifest_path,
+        "subset_manifest_path": bundle.subset_manifest_path,
+        "target_eval_indices_hash": bundle.target_eval_indices_hash,
         "target_synset": args.target_synset,
         "model_type": args.model_type,
         "aux_synsets_json": json.dumps(bundle.aux_synsets),

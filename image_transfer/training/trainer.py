@@ -5,8 +5,9 @@ import hashlib
 import json
 import math
 import time
-from collections import defaultdict
-from collections.abc import Callable, Iterator, Sequence
+import warnings
+from collections import defaultdict, deque
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,46 @@ from image_transfer.utils.io import ensure_dir, get_git_sha
 from image_transfer.utils.seed import isolated_seed, preserve_rng_state, set_seed
 
 TRAINING_PROTOCOLS = {"natural_compute_matched", "target_exposure_matched"}
+
+
+class _RollingLoss:
+    """Example-weighted rolling mean over a fixed number of optimizer steps."""
+
+    def __init__(self, max_steps: int, state: Sequence[Sequence[float | int]] | None = None) -> None:
+        if int(max_steps) < 1:
+            raise ValueError("rolling_loss_window must be positive")
+        self._values: deque[tuple[float, int]] = deque(maxlen=int(max_steps))
+        for item in state or ():
+            if len(item) != 2:
+                raise ValueError("invalid rolling loss state")
+            self._values.append((float(item[0]), int(item[1])))
+
+    def add(self, total: float, count: int) -> None:
+        self._values.append((float(total), int(count)))
+
+    def mean(self) -> float:
+        count = sum(item[1] for item in self._values)
+        if count == 0:
+            return float("nan")
+        return float(sum(item[0] for item in self._values) / count)
+
+    def state(self) -> list[list[float | int]]:
+        return [[total, count] for total, count in self._values]
+
+
+def _per_example_loss(loss: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """Reduce a ``reduction='none'`` loss only over non-batch dimensions."""
+
+    if loss.ndim == 0:
+        raise ValueError("diffusion.loss(reduction='none') returned a scalar")
+    if int(loss.shape[0]) != int(batch_size):
+        raise ValueError("per-example loss has the wrong batch dimension")
+    return loss if loss.ndim == 1 else loss.flatten(1).mean(dim=1)
+
+
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor | None:
+    selected = values[mask]
+    return selected.mean() if selected.numel() else None
 
 
 def _write_log_row(path: Path, row: dict[str, float | int]) -> None:
@@ -373,6 +414,8 @@ def train_image_model(
     train_log_path: str | Path | None = None,
     resume: bool = False,
     validation_interval: int = 100,
+    checkpoint_interval: int | None = None,
+    rolling_loss_window: int = 100,
     num_workers: int = 0,
     # Rigorous extensions; all are optional for old callers.
     target_dataset=None,
@@ -391,6 +434,7 @@ def train_image_model(
     config_hash: str | None = None,
     manifest_hash: str | None = None,
     git_sha: str | None = None,
+    checkpoint_provenance: Mapping[str, Any] | None = None,
     deterministic_cpu: bool = False,
 ):
     """Train an image diffusion model under one of two explicit protocols.
@@ -409,6 +453,20 @@ def train_image_model(
         raise ValueError("steps must be non-negative")
     if auxiliary_loss_weight < 0:
         raise ValueError("auxiliary_loss_weight must be non-negative")
+    if int(validation_interval) < 1:
+        raise ValueError("validation_interval must be positive")
+    resolved_checkpoint_interval = int(checkpoint_interval or validation_interval)
+    if resolved_checkpoint_interval < 1:
+        raise ValueError("checkpoint_interval must be positive")
+    if int(rolling_loss_window) < 1:
+        raise ValueError("rolling_loss_window must be positive")
+    if int(num_workers) > 0:
+        warnings.warn(
+            "num_workers > 0: checkpoints restore the deterministic sampler position, but augmentation "
+            "worker RNG/prefetch state is not captured, so resume is not guaranteed to be bitwise identical",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     device = torch.device(device)
 
     def build_model():
@@ -472,6 +530,8 @@ def train_image_model(
     start_step = 0
     counters = _protocol_counters()
     cumulative_train_seconds = 0.0
+    cumulative_optimizer_seconds = 0.0
+    saved_rolling_loss_state: dict[str, Any] = {}
     current_best = float("inf") if best_validation_metric is None else float(best_validation_metric)
     if resume_path is not None:
         checkpoint = load_training_checkpoint(
@@ -494,6 +554,8 @@ def train_image_model(
         saved_protocol_metadata = checkpoint.get("training_protocol_metadata") or {}
         counters = _protocol_counters(saved_protocol_metadata)
         cumulative_train_seconds = float(saved_protocol_metadata.get("wallclock_train_seconds", 0.0))
+        cumulative_optimizer_seconds = float(saved_protocol_metadata.get("optimizer_compute_seconds", 0.0))
+        saved_rolling_loss_state = dict(saved_protocol_metadata.get("rolling_loss_state") or {})
         saved_best = checkpoint.get("best_validation_metric")
         if saved_best is not None:
             current_best = float(saved_best)
@@ -509,6 +571,11 @@ def train_image_model(
     train_log = Path(train_log_path) if train_log_path else None
     if resume and train_log is not None:
         _clean_resume_log(train_log, start_step, validation_interval)
+
+    rolling_losses = {
+        name: _RollingLoss(int(rolling_loss_window), saved_rolling_loss_state.get(name))
+        for name in ("pooled", "target", "auxiliary")
+    }
 
     sampler_seed = int(training_seed if training_seed is not None else torch.initial_seed())
     if training_protocol == "target_exposure_matched":
@@ -562,8 +629,12 @@ def train_image_model(
         auxiliary_iterator = None
 
     final_loss = float("nan")
+    final_pooled_loss = float("nan")
     final_target_loss = float("nan")
     final_auxiliary_loss = float("nan")
+    final_pooled_batch_size = 0
+    final_target_batch_size = 0
+    final_auxiliary_batch_size = 0
     final_grad_norm = float("nan")
     gradient_clipping_count = 0
     denoise = {key: float("nan") for key in ("all", "low", "mid", "high", "standard_error", "num_validation_images", "num_corruptions")}
@@ -573,6 +644,8 @@ def train_image_model(
 
     def protocol_metadata(current_step: int) -> dict[str, Any]:
         total = counters["target_examples_seen"] + counters["auxiliary_examples_seen"]
+        elapsed = float(cumulative_train_seconds + (time.time() - start_time))
+        optimizer_seconds = float(cumulative_optimizer_seconds)
         return {
             **counters,
             "optimizer_steps": int(current_step),
@@ -581,7 +654,20 @@ def train_image_model(
             "target_batch_size": target_bs if training_protocol == "target_exposure_matched" else batch_size,
             "auxiliary_batch_size": aux_bs,
             "auxiliary_loss_weight": float(auxiliary_loss_weight),
-            "wallclock_train_seconds": float(cumulative_train_seconds + (time.time() - start_time)),
+            "wallclock_train_seconds": elapsed,
+            "optimizer_compute_seconds": optimizer_seconds,
+            "optimizer_steps_per_second": float(current_step / elapsed) if elapsed > 0 else float("nan"),
+            "samples_per_second": float(total / optimizer_seconds) if optimizer_seconds > 0 else float("nan"),
+            "images_processed_per_second": float(total / optimizer_seconds) if optimizer_seconds > 0 else float("nan"),
+            "wallclock_images_per_second": float(total / elapsed) if elapsed > 0 else float("nan"),
+            "actual_pooled_batch_size": int(final_pooled_batch_size),
+            "actual_target_batch_size": int(final_target_batch_size),
+            "actual_auxiliary_batch_size": int(final_auxiliary_batch_size),
+            "rolling_loss_window_steps": int(rolling_loss_window),
+            "rolling_loss_state": {name: values.state() for name, values in rolling_losses.items()},
+            "resume_bitwise_identity_guaranteed": bool(int(num_workers) == 0 and device.type == "cpu"),
+            "checkpoint_interval": int(resolved_checkpoint_interval),
+            "validation_interval": int(validation_interval),
         }
 
     def save_training_state(
@@ -612,9 +698,11 @@ def train_image_model(
             protocol_metadata=protocol_metadata(current_step),
             data_state={"sampler_seed": sampler_seed, "global_step": current_step, "num_workers": num_workers},
             model_metadata=architecture_metadata,
+            provenance=checkpoint_provenance,
         )
 
     for step in range(start_step, steps):
+        optimizer_step_start = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         if training_protocol == "natural_compute_matched":
             assert pooled_iterator is not None
@@ -623,9 +711,18 @@ def train_image_model(
             labels = labels.to(device, non_blocking=True)
             y = labels if conditional else None
             with torch.amp.autocast(device_type="cuda", enabled=(precision == "amp" and device.type == "cuda")):
-                loss = diffusion.loss(model, x, y)
-            target_count = int(x.shape[0]) if not conditional else int((labels == 0).sum().item())
-            auxiliary_count = int(x.shape[0]) - target_count
+                losses = _per_example_loss(
+                    diffusion.loss(model, x, y, reduction="none"),
+                    int(x.shape[0]),
+                )
+                loss = losses.mean()
+            target_mask = torch.ones_like(labels, dtype=torch.bool) if not conditional else labels == 0
+            auxiliary_mask = ~target_mask
+            target_loss = _masked_mean(losses, target_mask)
+            auxiliary_loss = _masked_mean(losses, auxiliary_mask)
+            pooled_loss = loss
+            target_count = int(target_mask.sum().item())
+            auxiliary_count = int(auxiliary_mask.sum().item())
             counters["target_examples_seen"] += target_count
             counters["auxiliary_examples_seen"] += auxiliary_count
             if conditional and auxiliary_count:
@@ -633,8 +730,18 @@ def train_image_model(
                 for class_id, count in zip(unique.tolist(), counts.tolist()):
                     key = str(int(class_id))
                     counters["auxiliary_examples_seen_by_class"][key] = counters["auxiliary_examples_seen_by_class"].get(key, 0) + int(count)
-            target_loss = loss
-            auxiliary_loss = None
+            rolling_losses["pooled"].add(float(losses.detach().sum().cpu()), int(losses.numel()))
+            rolling_losses["target"].add(
+                float(losses[target_mask].detach().sum().cpu()),
+                target_count,
+            )
+            rolling_losses["auxiliary"].add(
+                float(losses[auxiliary_mask].detach().sum().cpu()),
+                auxiliary_count,
+            )
+            final_pooled_batch_size = int(losses.numel())
+            final_target_batch_size = target_count
+            final_auxiliary_batch_size = auxiliary_count
         else:
             assert target_iterator is not None
             target_x, target_labels = next(target_iterator)
@@ -642,17 +749,28 @@ def train_image_model(
             target_labels = target_labels.to(device, non_blocking=True)
             target_y = target_labels if conditional else None
             with torch.amp.autocast(device_type="cuda", enabled=(precision == "amp" and device.type == "cuda")):
-                target_loss = diffusion.loss(model, target_x, target_y)
+                target_losses = _per_example_loss(
+                    diffusion.loss(model, target_x, target_y, reduction="none"),
+                    int(target_x.shape[0]),
+                )
+                target_loss = target_losses.mean()
                 if auxiliary_iterator is not None:
                     auxiliary_x, auxiliary_labels = next(auxiliary_iterator)
                     auxiliary_x = auxiliary_x.to(device, non_blocking=True)
                     auxiliary_labels = auxiliary_labels.to(device, non_blocking=True)
-                    auxiliary_loss = diffusion.loss(model, auxiliary_x, auxiliary_labels)
+                    auxiliary_losses = _per_example_loss(
+                        diffusion.loss(model, auxiliary_x, auxiliary_labels, reduction="none"),
+                        int(auxiliary_x.shape[0]),
+                    )
+                    auxiliary_loss = auxiliary_losses.mean()
                     loss = target_loss + auxiliary_loss_weight * auxiliary_loss
+                    pooled_loss = torch.cat((target_losses, auxiliary_losses)).mean()
                 else:
                     auxiliary_labels = None
+                    auxiliary_losses = target_losses.new_empty((0,))
                     auxiliary_loss = None
                     loss = target_loss
+                    pooled_loss = target_loss
             counters["target_examples_seen"] += int(target_x.shape[0])
             if auxiliary_labels is not None:
                 counters["auxiliary_examples_seen"] += int(auxiliary_labels.shape[0])
@@ -660,6 +778,18 @@ def train_image_model(
                 for class_id, count in zip(unique.tolist(), counts.tolist()):
                     key = str(int(class_id))
                     counters["auxiliary_examples_seen_by_class"][key] = counters["auxiliary_examples_seen_by_class"].get(key, 0) + int(count)
+            rolling_losses["pooled"].add(
+                float(target_losses.detach().sum().cpu()) + float(auxiliary_losses.detach().sum().cpu()),
+                int(target_losses.numel() + auxiliary_losses.numel()),
+            )
+            rolling_losses["target"].add(float(target_losses.detach().sum().cpu()), int(target_losses.numel()))
+            rolling_losses["auxiliary"].add(
+                float(auxiliary_losses.detach().sum().cpu()),
+                int(auxiliary_losses.numel()),
+            )
+            final_pooled_batch_size = int(target_losses.numel() + auxiliary_losses.numel())
+            final_target_batch_size = int(target_losses.numel())
+            final_auxiliary_batch_size = int(auxiliary_losses.numel())
 
         scaler.scale(loss).backward()
         if max_grad_norm is not None:
@@ -671,8 +801,10 @@ def train_image_model(
         scaler.step(optimizer)
         scaler.update()
         ema.update(model)
+        cumulative_optimizer_seconds += time.perf_counter() - optimizer_step_start
         final_loss = float(loss.detach().cpu().item())
-        final_target_loss = float(target_loss.detach().cpu().item())
+        final_pooled_loss = float(pooled_loss.detach().cpu().item())
+        final_target_loss = float(target_loss.detach().cpu().item()) if target_loss is not None else float("nan")
         final_auxiliary_loss = float(auxiliary_loss.detach().cpu().item()) if auxiliary_loss is not None else float("nan")
         current_step = step + 1
         counters["optimizer_steps"] = current_step
@@ -705,7 +837,9 @@ def train_image_model(
             if eligible_for_best and math.isfinite(validation_metric) and validation_metric < current_best:
                 current_best = validation_metric
                 save_training_state(best_path, current_step)
-        if last_path is not None and (current_step == steps or current_step % max(validation_interval, 1) == 0):
+        if last_path is not None and (
+            current_step == steps or current_step % resolved_checkpoint_interval == 0
+        ):
             save_training_state(last_path, current_step)
             if legacy_alias is not None:
                 save_training_state(legacy_alias, current_step)
@@ -748,6 +882,15 @@ def train_image_model(
         else (float(denoise["all"]) if best_path is not None and best_path.exists() and math.isfinite(denoise["all"]) else None)
     )
     return ema.shadow, diffusion, {
+        "final_objective_train_loss": final_loss,
+        "final_pooled_train_loss": final_pooled_loss,
+        "final_target_batch_train_loss": final_target_loss,
+        "final_auxiliary_batch_train_loss": final_auxiliary_loss,
+        "rolling_pooled_train_loss": rolling_losses["pooled"].mean(),
+        "rolling_target_train_loss": rolling_losses["target"].mean(),
+        "rolling_auxiliary_train_loss": rolling_losses["auxiliary"].mean(),
+        # Compatibility aliases for result readers created before loss
+        # accounting distinguished the pooled and target-only components.
         "final_train_loss": final_loss,
         "final_target_train_loss": final_target_loss,
         "final_auxiliary_train_loss": final_auxiliary_loss,

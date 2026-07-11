@@ -22,7 +22,11 @@ from .feature_metrics import (
     real_feature_cache_key,
 )
 from .fid_kid import compute_fid_kid
-from .nearest_neighbors import compute_memorization_diagnostics, make_memorization_grid
+from .nearest_neighbors import (
+    calibrate_near_duplicate_threshold,
+    compute_memorization_diagnostics,
+    make_memorization_grid,
+)
 from .prdc import compute_prdc
 
 __all__ = [
@@ -30,6 +34,7 @@ __all__ = [
     "CorruptionRecord",
     "MetricBackendError",
     "MetricComputationError",
+    "calibrate_near_duplicate_threshold",
     "compute_feature_metrics",
     "compute_fid_kid",
     "compute_memorization_diagnostics",

@@ -413,6 +413,7 @@ def compute_feature_metrics(
     compute_prdc: bool | None = None,
     compute_prdc_metrics: bool | None = None,
     compute_inception_score: bool = False,
+    fid_reliable_min_real: int = 1000,
     kid_subset_size: int = 100,
     kid_num_subsets: int = 100,
     prdc_k: int = 5,
@@ -455,6 +456,8 @@ def compute_feature_metrics(
         )
     if int(real.shape[0]) == 0 or int(generated.shape[0]) == 0:
         raise ValueError("strict metrics require non-empty real and generated samples")
+    if int(fid_reliable_min_real) < 1:
+        raise ValueError("fid_reliable_min_real must be positive")
     if metric_backend != "torchmetrics" and feature_extractor is None:
         raise MetricBackendError(
             f"unsupported strict metric backend {metric_backend!r}; use 'torchmetrics' or inject a tested extractor"
@@ -531,9 +534,18 @@ def compute_feature_metrics(
         "kid_subset_size": int(kid_subset_size),
         "kid_num_subsets": int(kid_num_subsets),
         "prdc_k": int(prdc_k),
+        "fid_reliable_min_real": int(fid_reliable_min_real),
     }
 
     if compute_fid:
+        result["fid_reliability_warning"] = (
+            ""
+            if int(real.shape[0]) >= int(fid_reliable_min_real)
+            else (
+                f"FID uses only {int(real.shape[0])} real reference images, below the pre-specified "
+                f"reliability threshold of {int(fid_reliable_min_real)}; interpret it as a secondary endpoint"
+            )
+        )
         if min(real_features.shape[0], generated_features.shape[0]) < 2:
             result.update({"fid_target": float("nan"), "fid_target_status": "unavailable: fewer than two samples"})
         else:

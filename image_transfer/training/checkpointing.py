@@ -12,7 +12,7 @@ from torch import nn
 from image_transfer.training.ema import EMA
 from image_transfer.utils.seed import capture_rng_state, restore_rng_state
 
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
 
 
 def _model_state(value: nn.Module | EMA | Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -80,6 +80,7 @@ def save_checkpoint(
     protocol_metadata: dict[str, Any] | None = None,
     data_state: dict[str, Any] | None = None,
     model_metadata: dict[str, Any] | None = None,
+    provenance: Mapping[str, Any] | None = None,
 ) -> Path:
     """Atomically save a rigorous training checkpoint.
 
@@ -109,6 +110,7 @@ def save_checkpoint(
         "training_protocol_metadata": dict(protocol_metadata or {}),
         "data_state": dict(data_state or {}),
         "model_metadata": dict(model_metadata or {}),
+        "provenance": dict(provenance or {}),
         "extra": dict(extra or {}),
         # Backward-compatible aliases.  Resume must not use these aliases.
         "model": ema_state,
