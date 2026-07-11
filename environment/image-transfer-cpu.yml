@@ -1,0 +1,10 @@
+name: image-transfer-cpu
+channels: [pytorch, conda-forge]
+dependencies:
+  - python=3.12.13
+  - pip
+  - pytorch=2.7.1=cpu*
+  - torchvision=0.22.1=cpu*
+  - pip:
+      - --extra-index-url=https://download.pytorch.org/whl/cpu
+      - -r environment/requirements-image-lock.txt

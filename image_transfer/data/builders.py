@@ -13,13 +13,19 @@ from .imagenet_subset import RemappedImageFolder, load_imagefolder, validate_syn
 from .manifests import (
     ManifestInsufficientDataError,
     auxiliary_training_subset,
-    build_data_manifest,
+    build_split_manifest,
+    build_subset_manifest,
     canonical_sha256,
+    combine_manifests,
     equal_total_feasibility,
-    manifest_path,
     parse_sample_ref,
     persist_or_validate_manifest,
+    resolve_manifest_seeds,
+    split_manifest_path,
+    subset_manifest_path,
     target_training_subset,
+    validate_split_manifest,
+    validate_subset_manifest,
 )
 
 
@@ -62,6 +68,17 @@ class DatasetBundle:
     manifest: dict[str, Any] = field(default_factory=dict)
     manifest_hash: str = ""
     manifest_path: str = ""
+    split_manifest: dict[str, Any] = field(default_factory=dict)
+    subset_manifest: dict[str, Any] = field(default_factory=dict)
+    split_manifest_hash: str = ""
+    subset_manifest_hash: str = ""
+    split_manifest_path: str = ""
+    subset_manifest_path: str = ""
+    target_eval_indices_hash: str = ""
+    target_validation_indices_hash: str = ""
+    target_training_subset_hash: str = ""
+    paired_target_prefix_hash: str = ""
+    auxiliary_training_subset_hashes: dict[str, str] = field(default_factory=dict)
     feasibility: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -126,7 +143,7 @@ def _split_settings(cfg: Mapping[str, Any], *, num_auxiliary_classes: int) -> di
         "target_eval_size": eval_size,
         "target_val_size": val_size,
         "auxiliary_eval_size": int(split.get("auxiliary_eval_size", aux_eval_default)),
-        "mode": str(evaluation.get("mode", "debug" if cfg.get("use_fake_data", False) else "paper")),
+        "mode": str(evaluation.get("mode", "debug" if cfg.get("use_fake_data", False) else "strict")),
         "nested_training_subsets": bool(split.get("nested_training_subsets", True)),
     }
 
@@ -140,9 +157,23 @@ def _manifest_root(cfg: Mapping[str, Any]) -> Path:
     return output_root / "manifests"
 
 
-def _split_seed(cfg: Mapping[str, Any], job: Mapping[str, Any] | None, legacy_seed: int) -> int:
+def _manifest_seeds(
+    cfg: Mapping[str, Any], job: Mapping[str, Any] | None, legacy_seed: int
+) -> tuple[int, int]:
     split = cfg.get("data_split", {})
-    return int(_job_value(job, "data_split_seed", split.get("data_split_seed", legacy_seed)))
+    legacy_value = _job_value(job, "data_split_seed", split.get("data_split_seed"))
+    holdout_value = _job_value(job, "holdout_seed", split.get("holdout_seed"))
+    subset_value = _job_value(job, "training_subset_seed", split.get("training_subset_seed"))
+    if legacy_value is None and holdout_value is None and subset_value is None:
+        # The pre-v2 function-level ``seed`` fallback remains deterministic but
+        # does not emit a deprecation warning because no deprecated field was
+        # explicitly supplied.
+        holdout_value = subset_value = int(legacy_seed)
+    return resolve_manifest_seeds(
+        holdout_seed=None if holdout_value is None else int(holdout_value),
+        training_subset_seed=None if subset_value is None else int(subset_value),
+        data_split_seed=None if legacy_value is None else int(legacy_value),
+    )
 
 
 def _indices(references: list[str], expected_sources: set[str]) -> list[int]:
@@ -181,23 +212,23 @@ def _imagefolder_fingerprint(dataset: Any, classes: list[str], eval_dataset: Any
     return canonical_sha256({"train": selected_paths(dataset), "evaluation": selected_paths(eval_dataset)})
 
 
-def _create_and_persist_manifest(
+def _create_and_persist_manifests(
     cfg: Mapping[str, Any],
     job: Mapping[str, Any] | None,
     *,
     target_class: str,
     all_auxiliary: list[str],
-    data_split_seed: int,
+    holdout_seed: int,
+    training_subset_seed: int,
     train_pools: Mapping[str, list[int]],
     eval_pools: Mapping[str, list[int]] | None,
     dataset_fingerprint: str | None = None,
-) -> tuple[dict[str, Any], Path]:
+) -> tuple[dict[str, Any], dict[str, Any], Path, Path]:
     settings = _split_settings(cfg, num_auxiliary_classes=len(all_auxiliary))
-    experiment_family = str(_job_value(job, "experiment", "image_transfer"))
-    manifest = build_data_manifest(
+    split = build_split_manifest(
         dataset_name=str(cfg.get("dataset", "cifar10")),
         target_class=target_class,
-        data_split_seed=data_split_seed,
+        holdout_seed=holdout_seed,
         train_pools=train_pools,
         auxiliary_classes=all_auxiliary,
         eval_pools=eval_pools,
@@ -205,19 +236,33 @@ def _create_and_persist_manifest(
         target_eval_size=settings["target_eval_size"],
         target_val_size=settings["target_val_size"],
         auxiliary_eval_size=settings["auxiliary_eval_size"],
-        experiment_family=experiment_family,
         dataset_fingerprint=dataset_fingerprint,
         mode=settings["mode"],
-        nested_training_subsets=settings["nested_training_subsets"],
     )
-    path = manifest_path(
+    split_path = split_manifest_path(
         _manifest_root(cfg),
         dataset_name=str(cfg.get("dataset", "cifar10")),
         target_class=target_class,
-        data_split_seed=data_split_seed,
-        experiment_family=experiment_family,
+        holdout_seed=holdout_seed,
+        split_manifest_hash=split["split_manifest_hash"],
     )
-    return persist_or_validate_manifest(manifest, path)
+    split, split_path = persist_or_validate_manifest(split, split_path)
+    subset = build_subset_manifest(
+        split,
+        training_subset_seed=training_subset_seed,
+        nested_training_subsets=settings["nested_training_subsets"],
+    )
+    subset_path = subset_manifest_path(
+        _manifest_root(cfg),
+        dataset_name=str(cfg.get("dataset", "cifar10")),
+        target_class=target_class,
+        holdout_seed=holdout_seed,
+        training_subset_seed=training_subset_seed,
+        split_manifest_hash=split["split_manifest_hash"],
+        subset_manifest_hash=subset["subset_manifest_hash"],
+    )
+    subset, subset_path = persist_or_validate_manifest(subset, subset_path)
+    return split, subset, split_path, subset_path
 
 
 def count_available_target_images(cfg: dict[str, Any], target_synset: str) -> int:
@@ -268,7 +313,7 @@ def build_datasets_for_job(
     )
     selected_auxiliary = _parse_aux(job) if _uses_auxiliary_data(model_type) else []
     all_auxiliary = _all_auxiliary_classes(cfg, target_class, selected_auxiliary)
-    split_seed = _split_seed(cfg, job, seed)
+    holdout_seed, training_subset_seed = _manifest_seeds(cfg, job, seed)
     target_count = _model_target_count(model_type, n0, m_per_aux, k_aux)
 
     train_base: Dataset
@@ -285,19 +330,26 @@ def build_datasets_for_job(
         per_class = int(cfg.get("fake_data_size", 100000))
         total = max(per_class * len(all_classes), 1)
         label_ids = {label: index for index, label in enumerate(all_classes)}
+        fake_data_seed = int(cfg.get("fake_data_seed", 0))
         train_base = BlockLabeledDataset(
-            build_fake_data(total, image_size, max(len(all_classes), 1), split_seed), per_class, len(all_classes)
+            build_fake_data(total, image_size, max(len(all_classes), 1), fake_data_seed), per_class, len(all_classes)
         )
         train_eval_base = train_base
         official_eval_base = BlockLabeledDataset(
-            build_fake_data(total, image_size, max(len(all_classes), 1), split_seed + 1), per_class, len(all_classes)
+            build_fake_data(total, image_size, max(len(all_classes), 1), fake_data_seed + 1), per_class, len(all_classes)
         )
         train_pools = {
             label: list(range(index * per_class, (index + 1) * per_class)) for label, index in label_ids.items()
         }
         eval_pools = dict(train_pools) if source != "train_holdout" else None
         fingerprint = canonical_sha256(
-            {"kind": "FakeData", "per_class": per_class, "classes": all_classes, "image_size": image_size}
+            {
+                "kind": "FakeData",
+                "per_class": per_class,
+                "classes": all_classes,
+                "image_size": image_size,
+                "dataset_generation_seed": fake_data_seed,
+            }
         )
     elif dataset_name.startswith("cifar"):
         train_base = load_cifar10(data_root, image_size, train=True, download=bool(cfg.get("download", True)))
@@ -338,24 +390,39 @@ def build_datasets_for_job(
         fingerprint = _imagefolder_fingerprint(train_base, classes, official_eval_base)
 
     if manifest is None:
-        loaded_manifest, persisted_path = _create_and_persist_manifest(
+        split_manifest, subset_manifest, persisted_split_path, persisted_subset_path = _create_and_persist_manifests(
             cfg,
             job,
             target_class=target_class,
             all_auxiliary=all_auxiliary,
-            data_split_seed=split_seed,
+            holdout_seed=holdout_seed,
+            training_subset_seed=training_subset_seed,
             train_pools=train_pools,
             eval_pools=eval_pools,
             dataset_fingerprint=fingerprint,
         )
+        loaded_manifest = combine_manifests(split_manifest, subset_manifest)
     else:
         loaded_manifest = dict(manifest)
-        persisted_path = manifest_path(
+        split_manifest = dict(loaded_manifest.get("split_manifest", {}))
+        subset_manifest = dict(loaded_manifest.get("subset_manifest", {}))
+        validate_split_manifest(split_manifest)
+        validate_subset_manifest(subset_manifest, split_manifest=split_manifest)
+        persisted_split_path = split_manifest_path(
             _manifest_root(cfg),
             dataset_name=str(cfg.get("dataset", "cifar10")),
             target_class=target_class,
-            data_split_seed=split_seed,
-            experiment_family=str(_job_value(job, "experiment", "image_transfer")),
+            holdout_seed=holdout_seed,
+            split_manifest_hash=split_manifest["split_manifest_hash"],
+        )
+        persisted_subset_path = subset_manifest_path(
+            _manifest_root(cfg),
+            dataset_name=str(cfg.get("dataset", "cifar10")),
+            target_class=target_class,
+            holdout_seed=holdout_seed,
+            training_subset_seed=training_subset_seed,
+            split_manifest_hash=split_manifest["split_manifest_hash"],
+            subset_manifest_hash=subset_manifest["subset_manifest_hash"],
         )
 
     feasibility = equal_total_feasibility(loaded_manifest, n0=n0, m_per_aux=m_per_aux, k_aux=k_aux)
@@ -372,6 +439,7 @@ def build_datasets_for_job(
         for auxiliary in selected_auxiliary
     }
     aux_indices = {auxiliary: _indices(refs, {"train"}) for auxiliary, refs in aux_refs.items()}
+    paired_target_refs = target_training_subset(loaded_manifest, n0)
 
     selected_labels = [target_class, *selected_auxiliary]
     target_train = RemappedDataset(
@@ -454,6 +522,19 @@ def build_datasets_for_job(
         auxiliary_eval_by_class=auxiliary_eval_by_class,
         manifest=loaded_manifest,
         manifest_hash=str(loaded_manifest["manifest_hash"]),
-        manifest_path=str(persisted_path),
+        manifest_path=str(persisted_subset_path),
+        split_manifest=split_manifest,
+        subset_manifest=subset_manifest,
+        split_manifest_hash=str(split_manifest["split_manifest_hash"]),
+        subset_manifest_hash=str(subset_manifest["subset_manifest_hash"]),
+        split_manifest_path=str(persisted_split_path),
+        subset_manifest_path=str(persisted_subset_path),
+        target_eval_indices_hash=canonical_sha256(split_manifest["target"]["eval"]),
+        target_validation_indices_hash=canonical_sha256(split_manifest["target"]["validation"]),
+        target_training_subset_hash=canonical_sha256(target_refs),
+        paired_target_prefix_hash=canonical_sha256(paired_target_refs),
+        auxiliary_training_subset_hashes={
+            auxiliary: canonical_sha256(references) for auxiliary, references in sorted(aux_refs.items())
+        },
         feasibility=feasibility,
     )

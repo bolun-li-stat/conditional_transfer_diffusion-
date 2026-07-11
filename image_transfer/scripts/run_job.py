@@ -25,6 +25,7 @@ def main() -> None:
     restart.add_argument("--resume", action="store_true")
     restart.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--override-readiness-gate", action="store_true")
     args = parser.parse_args()
     index = args.job_index if args.job_index is not None else int(os.environ.get("SLURM_ARRAY_TASK_ID", "0"))
     with open(args.jobs_csv, newline="", encoding="utf-8") as handle:
@@ -63,6 +64,7 @@ def main() -> None:
         resume=args.resume,
         force=args.force,
         dry_run=args.dry_run,
+        override_readiness_gate=args.override_readiness_gate,
     )
     try:
         run(namespace, job)

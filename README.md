@@ -190,7 +190,7 @@ Recommended Colab workflow:
 6. Save outputs frequently under Drive-backed `results_T1000_K3/` if you are worried about disconnects.
 7. Use checkpoint resume and partial CSV skipping to continue later.
 
-Codex can generate and test this project in its own coding environment, but running the full GPU experiment in Google Colab requires you to open the notebook or repo in your own Colab session and manually choose an available GPU runtime. The code automatically uses the best available CUDA device in that session, but the exact GPU assigned by Colab cannot be guaranteed.
+Automated tests can validate this project in a CPU development environment, but running the full GPU experiment in Google Colab requires opening the notebook or repository in your own Colab session and selecting an available GPU runtime. The code uses the available CUDA device in that session, but the exact GPU assigned by Colab cannot be guaranteed.
 
 ## Interpreting results
 

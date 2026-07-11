@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -14,7 +15,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from image_transfer.utils.io import load_json, normalize_result_record, validate_result_record
+from image_transfer.utils.io import (
+    atomic_write_json,
+    canonical_json_hash,
+    load_json,
+    normalize_result_record,
+    validate_result_record,
+)
 from image_transfer.evaluation.classifier_fidelity import imagenet_synset_to_index
 
 PRIMARY_BASELINES = {
@@ -61,7 +68,14 @@ PAIR_KEY_COLUMNS = [
     "m_per_aux",
     "K_aux",
     "baseline_target_count",
-    "data_split_seed",
+    "architecture",
+    "architecture_profile",
+    "model_config_hash",
+    "holdout_seed",
+    "training_subset_seed",
+    "split_manifest_hash",
+    "subset_manifest_hash",
+    "paired_target_prefix_hash",
     "model_initialization_seed",
     "training_seed",
     "training_protocol",
@@ -69,15 +83,26 @@ PAIR_KEY_COLUMNS = [
     "evaluation_seed",
     "sampler",
     "sampling_steps",
-    "effective_run_spec_hash",
-    "config_hash",
+    "resolved_run_spec_hash",
+    "resolved_config_hash",
+    "study_plan_hash",
+    "target_set_hash",
+    "environment_lock_hash",
+    "environment_runtime_hash",
 ]
 BASELINE_PAIR_KEY_COLUMNS = [
     "experiment",
     "target_synset",
     "n0",
     "baseline_target_count",
-    "data_split_seed",
+    "architecture",
+    "architecture_profile",
+    "model_config_hash",
+    "holdout_seed",
+    "training_subset_seed",
+    "split_manifest_hash",
+    "subset_manifest_hash",
+    "paired_target_prefix_hash",
     "model_initialization_seed",
     "training_seed",
     "training_protocol",
@@ -85,8 +110,11 @@ BASELINE_PAIR_KEY_COLUMNS = [
     "evaluation_seed",
     "sampler",
     "sampling_steps",
-    "effective_run_spec_hash",
-    "config_hash",
+    "resolved_config_hash",
+    "study_plan_hash",
+    "target_set_hash",
+    "environment_lock_hash",
+    "environment_runtime_hash",
 ]
 GROUP_COLUMNS = [
     "experiment",
@@ -97,6 +125,25 @@ GROUP_COLUMNS = [
     "m_per_aux",
     "K_aux",
     "training_protocol",
+    "architecture",
+    "architecture_profile",
+    "model_config_hash",
+    "target_set_hash",
+    "environment_lock_hash",
+    "environment_runtime_hash",
+]
+
+HIERARCHY_ID_COLUMNS = [
+    "target_synset",
+    "split_manifest_hash",
+    "subset_manifest_hash",
+    "holdout_seed",
+    "training_subset_seed",
+]
+
+OPTIMIZATION_ID_COLUMNS = [
+    "model_initialization_seed",
+    "training_seed",
 ]
 
 
@@ -211,6 +258,18 @@ def _normalize_columns(frame: pd.DataFrame) -> pd.DataFrame:
             result[name] = result["seed"]
         else:
             result[name] = result[name].where(result[name].notna(), result["seed"])
+    if "holdout_seed" not in result:
+        result["holdout_seed"] = result["data_split_seed"]
+    else:
+        result["holdout_seed"] = result["holdout_seed"].where(
+            result["holdout_seed"].notna(), result["data_split_seed"]
+        )
+    if "training_subset_seed" not in result:
+        result["training_subset_seed"] = result["data_split_seed"]
+    else:
+        result["training_subset_seed"] = result["training_subset_seed"].where(
+            result["training_subset_seed"].notna(), result["data_split_seed"]
+        )
     if "training_protocol" not in result:
         result["training_protocol"] = "natural_compute_matched"
     result["training_protocol"] = result["training_protocol"].replace("", "natural_compute_matched").fillna("natural_compute_matched")
@@ -227,14 +286,67 @@ def _normalize_columns(frame: pd.DataFrame) -> pd.DataFrame:
         "config_hash": "",
         "effective_run_spec_hash": "",
         "sampling_steps": 0,
+        "architecture": "legacy_simple_unet",
+        "architecture_profile": "legacy",
+        "manifest_hash": "",
+        "split_manifest_hash": "",
+        "subset_manifest_hash": "",
+        "target_training_subset_hash": "",
+        "paired_target_prefix_hash": "",
+        "model_config_hash": "",
+        "resolved_run_spec_hash": "",
+        "resolved_config_hash": "",
+        "study_plan_hash": "",
+        "target_set_hash": "",
+        "environment_lock_hash": "",
+        "environment_runtime_hash": "",
     }
     for key, value in defaults.items():
         if key not in result:
             result[key] = value
         else:
             result[key] = result[key].fillna(value)
-    for name in ("n0", "m_per_aux", "K_aux", "seed", "data_split_seed", "model_initialization_seed", "training_seed", "sampling_seed", "evaluation_seed", "sampling_steps"):
+    for name in (
+        "n0", "m_per_aux", "K_aux", "seed", "data_split_seed", "holdout_seed",
+        "training_subset_seed", "model_initialization_seed", "training_seed",
+        "sampling_seed", "evaluation_seed", "sampling_steps",
+    ):
         result[name] = pd.to_numeric(result[name], errors="coerce").fillna(0).astype(int)
+    # Legacy records are kept analyzable, but all v2 identities prefer their
+    # explicit hashes.  The fallbacks never make two records with different
+    # known identities equal.
+    result["split_manifest_hash"] = result["split_manifest_hash"].replace("", np.nan).fillna(
+        result["manifest_hash"]
+    )
+    result["subset_manifest_hash"] = result["subset_manifest_hash"].replace("", np.nan).fillna(
+        result["manifest_hash"]
+    )
+    result["paired_target_prefix_hash"] = result["paired_target_prefix_hash"].replace("", np.nan).fillna(
+        result["target_training_subset_hash"]
+    )
+    result["model_config_hash"] = result["model_config_hash"].replace("", np.nan).fillna(
+        result["architecture"].astype(str) + ":" + result["architecture_profile"].astype(str)
+    )
+    if "effective_run_spec_hash" not in result:
+        result["effective_run_spec_hash"] = ""
+    result["resolved_run_spec_hash"] = result["resolved_run_spec_hash"].replace("", np.nan).fillna(
+        result["effective_run_spec_hash"]
+    )
+    if "config_hash" not in result:
+        result["config_hash"] = ""
+    result["resolved_config_hash"] = result["resolved_config_hash"].replace("", np.nan).fillna(
+        result["config_hash"]
+    )
+    result["target_set_hash"] = result["target_set_hash"].replace("", np.nan).fillna(
+        result["config_hash"]
+    )
+    result["study_plan_hash"] = result["study_plan_hash"].replace("", "legacy-untracked")
+    result["environment_lock_hash"] = result["environment_lock_hash"].replace("", "legacy-untracked")
+    result["environment_runtime_hash"] = result["environment_runtime_hash"].replace("", "legacy-untracked")
+    result["training_subset_replicate_id"] = result["training_subset_seed"].astype(str)
+    result["optimization_repeat_id"] = (
+        result["model_initialization_seed"].astype(str) + ":" + result["training_seed"].astype(str)
+    )
     if "total_auxiliary_budget" not in result:
         result["total_auxiliary_budget"] = result["m_per_aux"] * result["K_aux"]
     else:
@@ -290,6 +402,22 @@ def improvement_positive(model_value: float, baseline_value: float, metric: str)
     if METRIC_DIRECTIONS[metric] == "lower":
         return float(baseline_value - model_value)
     return float(model_value - baseline_value)
+
+
+def _sample_count_fields(frame: pd.DataFrame) -> dict[str, Any]:
+    """Keep reference/generated counts visible in every metric summary."""
+
+    fields: dict[str, Any] = {}
+    for sources, output in (
+        (("num_real_eval",), "num_real_eval"),
+        (("num_generated", "num_generated_eval"), "num_generated_eval"),
+    ):
+        source = next((name for name in sources if name in frame), sources[0])
+        values = pd.to_numeric(frame.get(source, pd.Series(dtype=float)), errors="coerce").dropna()
+        fields[output] = int(values.iloc[0]) if not values.empty and values.nunique() == 1 else np.nan
+        fields[f"{output}_min"] = int(values.min()) if not values.empty else np.nan
+        fields[f"{output}_max"] = int(values.max()) if not values.empty else np.nan
+    return fields
 
 
 def _paired_baseline_leakage(baseline: pd.Series, candidate: pd.Series) -> float:
@@ -351,18 +479,34 @@ def compute_paired_gaps(
             model_status = "completed" if str(model.get("status", "completed")) == "completed" else "skipped_model"
         else:
             model_status = "failed_model" if run_id in failed_run_ids else "missing_model"
+        # Expected grids do not necessarily contain content hashes that only
+        # become available after dataset preflight.  Completed runs do, so use
+        # the actual model record for strict pairing whenever it exists.
+        pair_identity = model if model is not None else candidate
         experiment = str(candidate["experiment"])
         for baseline_kind, mapping in (("primary", PRIMARY_BASELINES), ("legacy", LEGACY_BASELINES)):
             baseline_type = mapping.get(experiment)
             if baseline_type is None:
                 continue
-            matching = baseline_lookup.get((baseline_type, _baseline_pair_key(candidate)), [])
-            baseline = matching[0] if matching else None
+            # A deliberately disabled legacy control is not a missing pair.
+            # Only summarize a baseline family that was present in the
+            # declared grid or in completed results.
+            baseline_declared = any(
+                key[0] == baseline_type
+                for key in (*baseline_lookup.keys(), *expected_baseline_lookup.keys())
+            )
+            if not baseline_declared:
+                continue
+            matching = baseline_lookup.get((baseline_type, _baseline_pair_key(pair_identity)), [])
+            ambiguous_baseline = len(matching) > 1
+            baseline = matching[0] if len(matching) == 1 else None
             expected_baselines = expected_baseline_lookup.get(
                 (baseline_type, _baseline_pair_key(candidate)), []
             )
             expected_baseline_ids = {str(row.get("run_id", "")) for row in expected_baselines}
-            if baseline is not None:
+            if ambiguous_baseline:
+                baseline_status = "ambiguous_baseline"
+            elif baseline is not None:
                 baseline_status = "completed" if str(baseline.get("status", "completed")) == "completed" else "skipped_baseline"
             elif expected_baseline_ids & failed_run_ids:
                 baseline_status = "failed_baseline"
@@ -381,7 +525,7 @@ def compute_paired_gaps(
                         pair_status = "missing_metric"
                     else:
                         gap = improvement_positive(float(model_value), float(baseline_value), metric)
-                row = {column: candidate.get(column) for column in PAIR_KEY_COLUMNS}
+                row = {column: pair_identity.get(column) for column in PAIR_KEY_COLUMNS}
                 for column in (
                     "model_type",
                     "aux_set",
@@ -391,6 +535,10 @@ def compute_paired_gaps(
                     "aux_draw_id",
                     "auxiliary_ratio",
                     "total_auxiliary_budget",
+                    "training_subset_replicate_id",
+                    "optimization_repeat_id",
+                    "target_training_subset_hash",
+                    "auxiliary_training_subset_hashes",
                 ):
                     row[column] = (model if model is not None else candidate).get(column)
                 row.update(
@@ -405,7 +553,15 @@ def compute_paired_gaps(
                         "baseline_metric": baseline_value,
                         "improvement_positive": gap,
                         "pair_status": pair_status,
-                        "ambiguous_baseline_count": max(len(matching) - 1, 0),
+                        "ambiguous_baseline_count": len(matching) if ambiguous_baseline else 0,
+                        "num_real_eval": (
+                            model.get("num_real_eval") if model is not None else candidate.get("num_real_eval")
+                        ),
+                        "num_generated": (
+                            model.get("num_generated") if model is not None else candidate.get("num_generated")
+                        ),
+                        "baseline_num_real_eval": baseline.get("num_real_eval") if baseline is not None else np.nan,
+                        "baseline_num_generated": baseline.get("num_generated") if baseline is not None else np.nan,
                     }
                 )
                 rows.append(row)
@@ -494,7 +650,8 @@ def summarize_paired_gaps(pairs: pd.DataFrame) -> pd.DataFrame:
             column
             for column in (
                 "target_synset",
-                "data_split_seed",
+                "split_manifest_hash",
+                "subset_manifest_hash",
                 "model_initialization_seed",
                 "training_seed",
                 "sampling_seed",
@@ -525,6 +682,202 @@ def summarize_paired_gaps(pairs: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _condition_columns(frame: pd.DataFrame) -> list[str]:
+    """Scientific condition columns that must never be pooled implicitly."""
+
+    return [
+        column
+        for column in (
+            "experiment",
+            "model_type",
+            "aux_set",
+            "n0",
+            "m_per_aux",
+            "K_aux",
+            "auxiliary_ratio",
+            "total_auxiliary_budget",
+            "average_auxiliary_similarity",
+            "training_protocol",
+            "architecture",
+            "architecture_profile",
+            "model_config_hash",
+            "sampler",
+            "sampling_steps",
+            "resolved_config_hash",
+            "study_plan_hash",
+            "target_set_hash",
+            "environment_lock_hash",
+            "environment_runtime_hash",
+            "baseline_kind",
+            "baseline_model_type",
+            "metric",
+        )
+        if column in frame
+    ]
+
+
+def _unique_rows(frame: pd.DataFrame, columns: list[str]) -> int:
+    present = [column for column in columns if column in frame]
+    return int(len(frame[present].drop_duplicates())) if present and not frame.empty else int(bool(len(frame)))
+
+
+def summarize_by_training_subset(pairs: pd.DataFrame) -> pd.DataFrame:
+    """Average draws within optimization repeats, then repeats within subsets."""
+
+    if pairs.empty:
+        return pd.DataFrame()
+    condition = _condition_columns(pairs)
+    subset_ids = [column for column in HIERARCHY_ID_COLUMNS if column in pairs]
+    group_columns = list(dict.fromkeys([*condition, *subset_ids]))
+    rows: list[dict[str, Any]] = []
+    for keys, group in pairs.groupby(group_columns, dropna=False):
+        keys = keys if isinstance(keys, tuple) else (keys,)
+        row = dict(zip(group_columns, keys))
+        complete = group[group["pair_status"] == "completed"]
+        optimization_ids = [column for column in OPTIMIZATION_ID_COLUMNS if column in complete]
+        if complete.empty:
+            optimization_values: list[float] = []
+        elif optimization_ids:
+            # Auxiliary draws and repeated evaluation streams are nested inside
+            # one trained-model repeat; they cannot increase the target-data n.
+            optimization_values = (
+                complete.groupby(optimization_ids, dropna=False)["improvement_positive"].mean().tolist()
+            )
+        else:
+            optimization_values = [float(complete["improvement_positive"].mean())]
+        row.update(t95_confidence_interval(optimization_values))
+        row.update(_sample_count_fields(complete))
+        row.update(
+            {
+                "summary_type": "training_subset",
+                "improvement_positive": float(np.mean(optimization_values)) if optimization_values else np.nan,
+                "number_targets": 1,
+                "number_independent_training_subsets": 1,
+                "number_optimization_repeats": _unique_rows(group, OPTIMIZATION_ID_COLUMNS),
+                "number_completed_optimization_repeats": len(optimization_values),
+                "number_auxiliary_draws": _unique_rows(group, ["aux_draw_id", "aux_composition"]),
+                "number_completed_draw_pairs": int(len(complete)),
+                "number_missing_failed_pairs": int(len(group) - len(complete)),
+                "number_unique_baseline_runs": int(complete.get("baseline_run_id", pd.Series(dtype=str)).nunique()),
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def summarize_by_target(subset_summaries: pd.DataFrame) -> pd.DataFrame:
+    """Compute target-conditional intervals across independent subsets."""
+
+    if subset_summaries.empty:
+        return pd.DataFrame()
+    condition = _condition_columns(subset_summaries)
+    group_columns = [*condition, "target_synset"]
+    rows: list[dict[str, Any]] = []
+    for keys, group in subset_summaries.groupby(group_columns, dropna=False):
+        keys = keys if isinstance(keys, tuple) else (keys,)
+        row = dict(zip(group_columns, keys))
+        values = pd.to_numeric(group["improvement_positive"], errors="coerce")
+        stats = t95_confidence_interval(values.tolist())
+        row.update(stats)
+        row.update(_sample_count_fields(group))
+        row.update(
+            {
+                "summary_type": "target_conditional",
+                "improvement_positive": stats["mean"],
+                "conditional_on_target_ci95_lower": stats["ci95_lower"],
+                "conditional_on_target_ci95_upper": stats["ci95_upper"],
+                "across_subset_ci95_lower": stats["ci95_lower"],
+                "across_subset_ci95_upper": stats["ci95_upper"],
+                "number_targets": 1,
+                "number_holdout_splits": int(group.get("split_manifest_hash", pd.Series(dtype=str)).nunique()),
+                "number_independent_training_subsets": int(values.notna().sum()),
+                "number_optimization_repeats": int(group["number_optimization_repeats"].sum()),
+                "number_auxiliary_draws": int(group["number_auxiliary_draws"].sum()),
+                "number_completed_draw_pairs": int(group["number_completed_draw_pairs"].sum()),
+                "number_missing_failed_pairs": int(group["number_missing_failed_pairs"].sum()),
+            }
+        )
+        row.update(_sample_count_fields(group))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def hierarchical_target_bootstrap(
+    subset_summaries: pd.DataFrame,
+    *,
+    bootstrap_samples: int = 1000,
+    bootstrap_seed: int = 0,
+) -> pd.DataFrame:
+    """Target-cluster bootstrap with subset resampling inside each target."""
+
+    if subset_summaries.empty:
+        return pd.DataFrame()
+    condition = _condition_columns(subset_summaries)
+    rows: list[dict[str, Any]] = []
+    for keys, group in subset_summaries.groupby(condition, dropna=False):
+        keys = keys if isinstance(keys, tuple) else (keys,)
+        row = dict(zip(condition, keys))
+        target_groups = {
+            str(target): part[pd.to_numeric(part["improvement_positive"], errors="coerce").notna()]
+            for target, part in group.groupby("target_synset", dropna=False)
+        }
+        target_groups = {target: part for target, part in target_groups.items() if not part.empty}
+        target_means = [float(part["improvement_positive"].mean()) for part in target_groups.values()]
+        row.update(
+            {
+                "summary_type": "hierarchical_across_target",
+                "mean": float(np.mean(target_means)) if target_means else np.nan,
+                "improvement_positive": float(np.mean(target_means)) if target_means else np.nan,
+                "number_targets": len(target_groups),
+                "number_independent_training_subsets": int(
+                    pd.to_numeric(group["improvement_positive"], errors="coerce").notna().sum()
+                ),
+                "number_optimization_repeats": int(group["number_optimization_repeats"].sum()),
+                "number_auxiliary_draws": int(group["number_auxiliary_draws"].sum()),
+                "number_completed_draw_pairs": int(group["number_completed_draw_pairs"].sum()),
+                "number_missing_failed_pairs": int(group["number_missing_failed_pairs"].sum()),
+            }
+        )
+        if len(target_groups) < 2:
+            row.update(
+                {
+                    "hierarchical_status": "unavailable_single_target",
+                    "across_target_ci95_lower": np.nan,
+                    "across_target_ci95_upper": np.nan,
+                    "ci95_lower": np.nan,
+                    "ci95_upper": np.nan,
+                }
+            )
+            rows.append(row)
+            continue
+        digest = hashlib.sha256(repr(keys).encode("utf-8")).digest()
+        rng = np.random.default_rng(int(bootstrap_seed) ^ int.from_bytes(digest[:8], "big"))
+        targets = list(target_groups)
+        bootstrap_values: list[float] = []
+        for _ in range(int(bootstrap_samples)):
+            sampled_target_means: list[float] = []
+            for target_index in rng.integers(0, len(targets), len(targets)):
+                values = pd.to_numeric(
+                    target_groups[targets[int(target_index)]]["improvement_positive"], errors="coerce"
+                ).to_numpy(dtype=float)
+                sampled = values[rng.integers(0, len(values), len(values))]
+                sampled_target_means.append(float(sampled.mean()))
+            bootstrap_values.append(float(np.mean(sampled_target_means)))
+        lower = float(np.quantile(bootstrap_values, 0.025))
+        upper = float(np.quantile(bootstrap_values, 0.975))
+        row.update(
+            {
+                "hierarchical_status": "available",
+                "across_target_ci95_lower": lower,
+                "across_target_ci95_upper": upper,
+                "ci95_lower": lower,
+                "ci95_upper": upper,
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def summarize_raw_metrics(results: pd.DataFrame) -> pd.DataFrame:
     if results.empty:
         return pd.DataFrame()
@@ -538,6 +891,7 @@ def summarize_raw_metrics(results: pd.DataFrame) -> pd.DataFrame:
             row = dict(zip(group_columns, keys))
             numeric = pd.to_numeric(group[metric], errors="coerce")
             row.update(t95_confidence_interval(numeric.tolist()))
+            row.update(_sample_count_fields(group))
             row.update(
                 {
                     "summary_type": "raw_metric",
@@ -589,7 +943,17 @@ def similarity_correlations(pairs: pd.DataFrame, bootstrap_samples: int = 1000) 
         row = dict(zip(group_columns, keys))
         row["spearman_correlation"] = _spearman(x, y)
         row["n"] = int(len(group))
-        cluster_columns = [column for column in ("target_synset", "data_split_seed", "training_seed") if column in group]
+        cluster_columns = [
+            column
+            for column in (
+                "target_synset",
+                "split_manifest_hash",
+                "subset_manifest_hash",
+                "model_initialization_seed",
+                "training_seed",
+            )
+            if column in group
+        ]
         bootstrap: list[float] = []
         if len(group) >= 3 and cluster_columns:
             grouped = [part for _, part in group.groupby(cluster_columns, dropna=False)]
@@ -643,6 +1007,132 @@ def _job_completeness(
     return frame
 
 
+def _environment_summary(results: pd.DataFrame) -> pd.DataFrame:
+    """Summarize immutable lock identity and the observed runtime fingerprint."""
+
+    columns = [
+        "environment_lock_hash",
+        "environment_runtime_hash",
+        "python_version",
+        "torch_version",
+        "torch_cuda_build",
+        "cudnn_version",
+        "driver_version",
+        "gpu_names_json",
+        "number_runs",
+        "number_targets",
+        "number_git_revisions",
+    ]
+    if results.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows: list[dict[str, Any]] = []
+    normalized = results.copy()
+    runtime_rows: list[dict[str, Any]] = []
+    for _, result in normalized.iterrows():
+        report = result.get("environment_report", {})
+        if isinstance(report, str):
+            try:
+                report = json.loads(report)
+            except json.JSONDecodeError:
+                report = {}
+        report = dict(report) if isinstance(report, dict) else {}
+        packages = report.get("packages", {})
+        packages = dict(packages) if isinstance(packages, dict) else {}
+        runtime_hash = str(
+            result.get("environment_runtime_hash", "")
+            or report.get("environment_runtime_hash", "")
+            or canonical_json_hash(
+                {
+                    "python_version": report.get("python_version", "untracked"),
+                    "packages": packages,
+                    "os": report.get("os", "untracked"),
+                    "torch_cuda_build": report.get("torch_cuda_build"),
+                    "cudnn_version": report.get("cudnn_version"),
+                    "gpu_names": report.get("gpu_names", []),
+                    "driver_version": report.get("driver_version", "unavailable"),
+                }
+            )
+        )
+        runtime_rows.append(
+            {
+                "environment_lock_hash": str(result.get("environment_lock_hash", "untracked")),
+                "environment_runtime_hash": runtime_hash,
+                "python_version": report.get("python_version", "untracked"),
+                "torch_version": packages.get("torch", "untracked"),
+                "torch_cuda_build": report.get("torch_cuda_build"),
+                "cudnn_version": report.get("cudnn_version"),
+                "driver_version": report.get("driver_version", "unavailable"),
+                "gpu_names_json": json.dumps(report.get("gpu_names", []), sort_keys=True),
+                "target_synset": result.get("target_synset"),
+                "git_sha": result.get("git_sha"),
+            }
+        )
+    frame = pd.DataFrame(runtime_rows)
+    group_columns = columns[:-3]
+    for keys, group in frame.groupby(group_columns, dropna=False):
+        keys = keys if isinstance(keys, tuple) else (keys,)
+        row = dict(zip(group_columns, keys))
+        row.update(
+            {
+                "number_runs": int(len(group)),
+                "number_targets": int(group["target_synset"].nunique(dropna=True)),
+                "number_git_revisions": int(group["git_sha"].nunique(dropna=True)),
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _readiness_summary(
+    results: pd.DataFrame,
+    failures: pd.DataFrame,
+    completeness: pd.DataFrame,
+    pairs: pd.DataFrame,
+    *,
+    invalid_record_count: int,
+) -> dict[str, Any]:
+    status_counts = (
+        completeness.get("status", pd.Series(dtype=str)).value_counts(dropna=False).to_dict()
+        if not completeness.empty
+        else {}
+    )
+    pair_counts = (
+        pairs.get("pair_status", pd.Series(dtype=str)).value_counts(dropna=False).to_dict()
+        if not pairs.empty
+        else {}
+    )
+    expected = int(len(completeness))
+    missing_or_failed = int(status_counts.get("missing", 0)) + int(status_counts.get("failed", 0))
+    noncompleted_pairs = sum(int(value) for key, value in pair_counts.items() if key != "completed")
+    complete = bool(
+        expected
+        and not missing_or_failed
+        and not noncompleted_pairs
+        and failures.empty
+        and invalid_record_count == 0
+    )
+    return {
+        "schema_version": "1.0",
+        "status": "complete" if complete else ("incomplete" if expected else "not_evaluable"),
+        "meaning": "result completeness only; release readiness is decided by the pilot validator",
+        "expected_job_count": expected,
+        "valid_result_count": int(len(results)),
+        "failure_record_count": int(len(failures)),
+        "invalid_result_count": int(invalid_record_count),
+        "job_status_counts": {str(key): int(value) for key, value in status_counts.items()},
+        "pair_status_counts": {str(key): int(value) for key, value in pair_counts.items()},
+        "noncompleted_pair_count": int(noncompleted_pairs),
+        "number_targets": int(results.get("target_synset", pd.Series(dtype=str)).nunique(dropna=True)),
+        "number_independent_training_subsets": int(
+            results.get("subset_manifest_hash", pd.Series(dtype=str)).replace("", np.nan).nunique(dropna=True)
+        ),
+        "number_environment_locks": int(
+            results.get("environment_lock_hash", pd.Series(dtype=str)).replace("", np.nan).nunique(dropna=True)
+        ),
+    }
+
+
 def aggregate_results(results_root: str | Path, *, expected_job_paths: Iterable[str | Path] | None = None) -> dict[str, pd.DataFrame]:
     root = Path(results_root)
     root.mkdir(parents=True, exist_ok=True)
@@ -656,22 +1146,42 @@ def aggregate_results(results_root: str | Path, *, expected_job_paths: Iterable[
     expected = _load_expected(supplied_paths)
     failed_ids = set(failures.get("run_id", pd.Series(dtype=str)).astype(str))
     pairs = compute_paired_gaps(results, expected_jobs=expected, failed_run_ids=failed_ids)
-    paired_summary = summarize_paired_gaps(pairs)
+    subset_summaries = summarize_by_training_subset(pairs)
+    target_summaries = summarize_by_target(subset_summaries)
+    hierarchical_summaries = hierarchical_target_bootstrap(subset_summaries)
+    # ``summary_metrics.csv`` remains the compact compatibility output; its
+    # paired portion now uses the correctly nested target-level summaries.
+    paired_summary = target_summaries.copy()
+    if not paired_summary.empty:
+        paired_summary["summary_type"] = "paired_transfer_gap"
     raw_summary = summarize_raw_metrics(results)
     summary = pd.concat([raw_summary, paired_summary], ignore_index=True, sort=False)
     completeness = _job_completeness(results, failures, expected, duplicate_counts)
     correlations = similarity_correlations(pairs)
+    environment_summary = _environment_summary(results)
+    readiness_summary = _readiness_summary(
+        results,
+        failures,
+        completeness,
+        pairs,
+        invalid_record_count=len(invalid_records),
+    )
 
     outputs = {
         "all_metrics": results,
         "summary_metrics": summary,
         "paired_transfer_gaps": pairs,
+        "subset_level_summaries": subset_summaries,
+        "target_level_summaries": target_summaries,
+        "hierarchical_summaries": hierarchical_summaries,
         "job_completeness": completeness,
         "failed_jobs": failures,
+        "environment_summary": environment_summary,
         "similarity_correlations": correlations,
     }
     for name, frame in outputs.items():
         _atomic_to_csv(frame, root / f"{name}.csv")
+    atomic_write_json(readiness_summary, root / "readiness_summary.json")
     return outputs
 
 

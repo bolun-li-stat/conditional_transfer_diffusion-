@@ -55,12 +55,52 @@ def test_fake_smoke_job_grid_has_architecture_baselines_without_duplicates(tmp_p
         assert len({row["run_id"] for row in rows}) == len(rows)
 
 
+def test_job_grid_limit_refuses_to_write_without_explicit_override(tmp_path: Path):
+    destination = tmp_path / "too_many.csv"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "image_transfer.scripts.make_job_grid",
+            "--experiment",
+            "A",
+            "--config",
+            FAKE_CONFIG,
+            "--out",
+            str(destination),
+            "--max-jobs",
+            "2",
+        ],
+        text=True,
+        capture_output=True,
+        env={**os.environ, "RESULTS_ROOT": str(tmp_path / "results")},
+    )
+    assert completed.returncode != 0
+    assert "Refusing to write" in completed.stderr
+    assert not destination.exists()
+
+
 def test_offline_cpu_pipeline_to_atomic_results_aggregation_and_plots(tmp_path: Path):
     results = tmp_path / "results"
     env = {
         "RESULTS_ROOT": str(results),
         "MPLCONFIGDIR": str(tmp_path / "matplotlib"),
     }
+    preflight_dir = tmp_path / "preflight"
+    run_cmd(
+        [
+            sys.executable,
+            "-m",
+            "image_transfer.scripts.preflight_experiment",
+            "--config",
+            FAKE_CONFIG,
+            "--out-dir",
+            str(preflight_dir),
+        ],
+        env=env,
+    )
+    preflight = json.loads((preflight_dir / "preflight_report.json").read_text(encoding="utf-8"))
+    assert preflight["status"] == "ready"
     jobs, rows = _grid(tmp_path, "A", env)
 
     # Run both baselines and the auxiliary model, producing a complete primary
@@ -91,8 +131,27 @@ def test_offline_cpu_pipeline_to_atomic_results_aggregation_and_plots(tmp_path: 
     assert len({record["metadata"]["target_training_subset_hash"] for record in records}) == 1
     assert all("fid_target" not in record["metrics"] for record in records)
     assert all("debug_pooled_pixel_distance" in record["metrics"] for record in records)
+    assert all("train_epsilon_mse_target" in record["metrics"] for record in records)
+    assert all("validation_epsilon_mse_target" in record["metrics"] for record in records)
+    assert all("test_epsilon_mse_target" in record["metrics"] for record in records)
+    assert all("train_validation_mse_gap" in record["metrics"] for record in records)
+    assert all("train_test_mse_gap" in record["metrics"] for record in records)
+    assert all("final_pooled_train_loss" in record["training"] for record in records)
+    assert all("rolling_target_train_loss" in record["training"] for record in records)
+    assert all(
+        len(
+            {
+                record["metrics"]["train_corruption_bank_hash"],
+                record["metrics"]["validation_corruption_bank_hash"],
+                record["metrics"]["test_corruption_bank_hash"],
+            }
+        )
+        == 3
+        for record in records
+    )
     assert all(Path(record["metadata"]["last_checkpoint_path"]).exists() for record in records)
     assert all(Path(record["metadata"]["best_checkpoint_path"]).exists() for record in records)
+    assert all(Path(record["metadata"]["train_corruption_bank_path"]).exists() for record in records)
     assert not list(results.rglob("metrics.csv"))
 
     # A terminal result is authoritative: --resume must not overwrite its
@@ -187,8 +246,13 @@ def test_offline_cpu_pipeline_to_atomic_results_aggregation_and_plots(tmp_path: 
         "all_metrics.csv",
         "summary_metrics.csv",
         "paired_transfer_gaps.csv",
+        "subset_level_summaries.csv",
+        "target_level_summaries.csv",
+        "hierarchical_summaries.csv",
         "job_completeness.csv",
         "failed_jobs.csv",
+        "environment_summary.csv",
+        "readiness_summary.json",
     ):
         assert (results / filename).exists()
     paired_text = (results / "paired_transfer_gaps.csv").read_text(encoding="utf-8")

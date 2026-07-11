@@ -1,5 +1,6 @@
 # Deprecated compatibility alias. Use cifar10_real_pilot.yaml.
 dataset: cifar10
+study_stage: pilot
 use_fake_data: false
 data_root: ${DATA_ROOT:-data}
 output_root: ${RESULTS_ROOT:-image_transfer_results_cifar_real}
@@ -17,17 +18,20 @@ targets:
       close: [truck, ship, airplane, dog, cat]
       medium: [ship, airplane, horse, deer, bird]
       far: [dog, cat, horse, deer, frog]
-experiments_to_run: [A]
 n0_values: [100, 250, 500]
-K_aux: 5
+K_aux_values: [5]
 m_per_aux_rule: equal_n0
-seeds: [0]
-model: {base_channels: 16, channel_mults: [1]}
-diffusion: {timesteps: 10, schedule: linear}
-optimizer: {lr: 0.001}
-training: {steps: 2, batch_size: 4, num_workers: 0, precision: fp32, validation_interval: 1}
-sampling_steps: 2
-sampler: ddim
+seed_design:
+  holdout_seed: 0
+  training_subset_seeds: [0]
+  optimization_seed_pairs:
+    - {model_initialization_seed: 0, training_seed: 0}
+  sampling_seed: 1000
+  evaluation_seed: 2000
+model: {architecture: adm_unet, profile: smoke_tiny}
+diffusion: {timesteps: 10, schedule: linear, prediction_type: epsilon, reverse_variance: fixed}
+optimizer: {name: adamw, lr: 0.001, betas: [0.9, 0.999], eps: 1.0e-8, weight_decay: 0.0}
+training: {steps: 2, batch_size: 4, num_workers: 0, precision: fp32, validation_interval: 1, ema_decay: 0.999, max_grad_norm: 1.0}
 sampling: {sampler: ddim, steps: 2, batch_size: 4, ddim_eta: 0.0}
 num_generated: 4
 experiments:
@@ -37,6 +41,7 @@ experiments:
 
 evaluation:
   mode: debug
-  compute_fid_kid: false
-  compute_classifier: false
+  compute_fid: false
+  compute_kid: false
+  compute_classifier_fidelity: false
   make_nearest_neighbors: false

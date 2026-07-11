@@ -27,7 +27,9 @@ from image_transfer.evaluation.feature_metrics import (
     compute_feature_metrics,
     real_feature_cache_key,
 )
+from image_transfer.evaluation import feature_metrics as feature_metric_module
 from image_transfer.evaluation.nearest_neighbors import (
+    calibrate_near_duplicate_threshold,
     compute_memorization_diagnostics,
     nearest_neighbor_search_from_features,
 )
@@ -176,7 +178,7 @@ def test_debug_metric_never_writes_fid_or_kid(tmp_path):
     assert cached["features"].shape[0] == len(real)
 
 
-def test_paper_mode_backend_failure_raises_without_fallback(monkeypatch):
+def test_strict_mode_backend_failure_raises_without_fallback(monkeypatch):
     import image_transfer.evaluation.feature_metrics as feature_metrics
 
     def fail(*args, **kwargs):
@@ -187,8 +189,8 @@ def test_paper_mode_backend_failure_raises_without_fallback(monkeypatch):
         compute_feature_metrics(
             torch.zeros(4, 3, 8, 8),
             torch.zeros(4, 3, 8, 8),
-            mode="paper",
-            real_manifest_hash="manifest-paper",
+            mode="strict",
+            real_manifest_hash="manifest-study",
         )
 
 
@@ -201,16 +203,44 @@ def test_cache_key_changes_with_manifest():
     assert real_feature_cache_key(manifest_hash="a", **kwargs) != real_feature_cache_key(
         manifest_hash="b", **kwargs
     )
+    assert real_feature_cache_key(manifest_hash="a", **kwargs) != real_feature_cache_key(
+        manifest_hash="a",
+        feature_extractor_id="extractor-v2",
+        preprocessing_config=kwargs["preprocessing_config"],
+        image_size=kwargs["image_size"],
+    )
 
 
-def test_unified_paper_metrics_with_injected_offline_extractor(tmp_path):
+def test_internal_fid_and_kid_match_pinned_backend_formulas():
+    from torchmetrics.image.fid import _compute_fid
+    from torchmetrics.image.kid import poly_mmd
+
+    generator = torch.Generator().manual_seed(91)
+    real = torch.randn(12, 5, generator=generator, dtype=torch.float64)
+    generated = torch.randn(12, 5, generator=generator, dtype=torch.float64) * 1.2 + 0.3
+    real_mean = real.mean(0)
+    generated_mean = generated.mean(0)
+    real_centered = real - real_mean
+    generated_centered = generated - generated_mean
+    real_covariance = real_centered.T @ real_centered / (len(real) - 1)
+    generated_covariance = generated_centered.T @ generated_centered / (len(generated) - 1)
+    expected_fid = _compute_fid(real_mean, real_covariance, generated_mean, generated_covariance)
+    actual_fid = feature_metric_module._frechet_distance(real, generated)
+    assert actual_fid == pytest.approx(float(expected_fid), rel=1e-8, abs=1e-8)
+
+    expected_kid = poly_mmd(real, generated)
+    actual_kid = feature_metric_module._unbiased_polynomial_mmd(real, generated)
+    assert float(actual_kid) == pytest.approx(float(expected_kid), rel=1e-12, abs=1e-12)
+
+
+def test_unified_strict_metrics_with_injected_offline_extractor(tmp_path):
     real = torch.linspace(-1, 1, 6 * 3 * 4 * 4).view(6, 3, 4, 4)
     generated = real.clone()
     result = compute_feature_metrics(
         generated,
         real,
-        mode="paper",
-        real_manifest_hash="manifest-paper",
+        mode="strict",
+        real_manifest_hash="manifest-study",
         cache_dir=tmp_path,
         feature_extractor=_TinyUint8Extractor(),
         feature_extractor_id="tiny-offline-test-v1",
@@ -224,6 +254,7 @@ def test_unified_paper_metrics_with_injected_offline_extractor(tmp_path):
     assert result["kid_target_status"] == "ok"
     assert result["prdc_status"] == "ok"
     assert result["precision_target"] == pytest.approx(1.0)
+    assert "only 6 real reference images" in result["fid_reliability_warning"]
     cached = torch.load(result["real_feature_cache_path"], map_location="cpu")
     assert {"features", "mean", "cov", "cache_key"}.issubset(cached)
 
@@ -290,3 +321,20 @@ def test_nearest_neighbor_search_is_batched_and_four_reference_stats_are_reporte
         assert f"nearest_neighbor_{name}_q05" in diagnostics
     assert diagnostics["nearest_neighbor_target_train_near_duplicate_rate"] == 1.0
     assert "nearest_neighbor_target_train_minus_eval_mean" in diagnostics
+
+
+def test_near_duplicate_threshold_is_calibrated_from_validation_real_to_real_distances():
+    validation = torch.tensor([[[[0.0]]], [[[1.0]]], [[[3.0]]]])
+    calibration = calibrate_near_duplicate_threshold(
+        validation,
+        quantile=0.5,
+        extractor=nn.Flatten(),
+        feature_batch_size=2,
+        distance_batch_size=2,
+        reference_batch_size=2,
+    )
+    # Leave-one-out nearest distances are [1, 1, 2].
+    assert calibration["near_duplicate_threshold"] == pytest.approx(1.0)
+    assert calibration["near_duplicate_calibration_split"] == "target_validation"
+    assert calibration["near_duplicate_calibration_quantile"] == 0.5
+    assert calibration["near_duplicate_calibration_num_images"] == 3

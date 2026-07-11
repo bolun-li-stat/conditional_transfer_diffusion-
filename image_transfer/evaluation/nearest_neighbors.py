@@ -149,6 +149,57 @@ def nearest_neighbor_statistics(
 
 
 @torch.no_grad()
+def calibrate_near_duplicate_threshold(
+    validation_images: torch.Tensor,
+    *,
+    quantile: float = 0.01,
+    device: str | torch.device = "cpu",
+    feature_batch_size: int = 64,
+    distance_batch_size: int = 256,
+    reference_batch_size: int = 1024,
+    extractor=None,
+    strict_feature_extractor: bool = False,
+) -> dict[str, float | int | str]:
+    """Calibrate a near-duplicate cutoff from validation real-to-real distances.
+
+    Every validation image is queried against the same validation set and its
+    self match is discarded by taking the second nearest neighbor. Generated
+    images and the final test split never participate in threshold selection.
+    """
+
+    if not 0.0 < float(quantile) < 1.0:
+        raise ValueError("near-duplicate calibration quantile must lie strictly between zero and one")
+    if validation_images.ndim != 4 or int(validation_images.shape[0]) < 2:
+        raise ValueError("near-duplicate calibration requires at least two validation images")
+    extractor = extractor or build_feature_extractor(device, strict=strict_feature_extractor)
+    features = batched_features(
+        extractor,
+        validation_images,
+        batch_size=feature_batch_size,
+        device=device,
+    )
+    distances, _ = nearest_neighbor_search_from_features(
+        features,
+        features,
+        k=2,
+        query_batch_size=distance_batch_size,
+        reference_batch_size=reference_batch_size,
+        device=device,
+    )
+    leave_one_out = distances[:, 1].detach().double().cpu()
+    threshold = float(torch.quantile(leave_one_out, float(quantile)))
+    return {
+        "near_duplicate_threshold": threshold,
+        "near_duplicate_calibration_method": "validation_real_to_real_leave_one_out_quantile",
+        "near_duplicate_calibration_split": "target_validation",
+        "near_duplicate_calibration_quantile": float(quantile),
+        "near_duplicate_calibration_num_images": int(validation_images.shape[0]),
+        "near_duplicate_calibration_distance_mean": float(leave_one_out.mean()),
+        "near_duplicate_calibration_distance_median": float(leave_one_out.median()),
+    }
+
+
+@torch.no_grad()
 def compute_memorization_diagnostics(
     generated: torch.Tensor,
     reference_sets: Mapping[str, torch.Tensor],
@@ -303,6 +354,7 @@ def make_nearest_neighbor_grid(
 
 __all__ = [
     "batched_features",
+    "calibrate_near_duplicate_threshold",
     "compute_memorization_diagnostics",
     "make_memorization_grid",
     "make_nearest_neighbor_grid",

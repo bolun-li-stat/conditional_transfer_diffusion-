@@ -12,7 +12,7 @@ from torch import nn
 from image_transfer.training.ema import EMA
 from image_transfer.utils.seed import capture_rng_state, restore_rng_state
 
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
 
 
 def _model_state(value: nn.Module | EMA | Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -79,8 +79,10 @@ def save_checkpoint(
     training_protocol: str | None = None,
     protocol_metadata: dict[str, Any] | None = None,
     data_state: dict[str, Any] | None = None,
+    model_metadata: dict[str, Any] | None = None,
+    provenance: Mapping[str, Any] | None = None,
 ) -> Path:
-    """Atomically save a publication-grade training checkpoint.
+    """Atomically save a rigorous training checkpoint.
 
     ``model``, ``optimizer``, ``step`` and ``extra`` retain the original public
     calling convention.  The legacy ``model`` key points to EMA weights when
@@ -107,6 +109,8 @@ def save_checkpoint(
         "training_protocol": training_protocol,
         "training_protocol_metadata": dict(protocol_metadata or {}),
         "data_state": dict(data_state or {}),
+        "model_metadata": dict(model_metadata or {}),
+        "provenance": dict(provenance or {}),
         "extra": dict(extra or {}),
         # Backward-compatible aliases.  Resume must not use these aliases.
         "model": ema_state,
@@ -126,6 +130,16 @@ def load_checkpoint(
     """Load weights for inference, preferring EMA for backward compatibility."""
 
     checkpoint = _torch_load(path, map_location=map_location)
+    metadata = checkpoint.get("model_metadata") or {}
+    expected_architecture = getattr(model, "resolved_model_config", {}).get("architecture")
+    expected_model_hash = getattr(model, "model_config_hash", None)
+    if metadata:
+        if expected_architecture and metadata.get("architecture") != expected_architecture:
+            raise ValueError(
+                f"Checkpoint architecture {metadata.get('architecture')!r} does not match model {expected_architecture!r}"
+            )
+        if expected_model_hash and metadata.get("model_config_hash") != expected_model_hash:
+            raise ValueError("Checkpoint model config hash does not match the constructed model")
     if use_ema:
         state = checkpoint.get("ema_model_state") or checkpoint.get("model")
     else:
@@ -146,6 +160,8 @@ def load_training_checkpoint(
     map_location: str | torch.device = "cpu",
     expected_config_hash: str | None = None,
     expected_manifest_hash: str | None = None,
+    expected_model_config_hash: str | None = None,
+    expected_architecture: str | None = None,
     restore_rng: bool = True,
     strict: bool = True,
 ) -> dict[str, Any]:
@@ -156,6 +172,11 @@ def load_training_checkpoint(
         raise ValueError("Checkpoint config hash does not match this run")
     if expected_manifest_hash and checkpoint.get("manifest_hash") not in {None, expected_manifest_hash}:
         raise ValueError("Checkpoint manifest hash does not match this run")
+    model_metadata = checkpoint.get("model_metadata") or {}
+    if expected_architecture and model_metadata.get("architecture") not in {None, expected_architecture}:
+        raise ValueError("Checkpoint architecture does not match this run")
+    if expected_model_config_hash and model_metadata.get("model_config_hash") not in {None, expected_model_config_hash}:
+        raise ValueError("Checkpoint model config hash does not match this run")
 
     raw_state = checkpoint.get("raw_model_state")
     if raw_state is None:
