@@ -4,9 +4,7 @@ This repository contains two independent experiment modules that study transfer 
 
 ## GMM simulation
 
-[`gmm_simulation/`](gmm_simulation/) contains the synthetic Gaussian-mixture experiments, including the original training, evaluation, plotting, configuration, and notebook entry points.
-
-The GMM files are relocation-only in PR #14. No GMM scientific source, configuration, notebook, result, or module README is intentionally modified, and the image-experiment CI does not install or run the GMM module. Its implementation and existing results are treated as frozen.
+[`gmm_simulation/`](gmm_simulation/) links to two self-contained studies: the relocated, scientifically unchanged AR(1)-Toeplitz experiment and a spectrum-matched covariance-rotation experiment. The latter isolates principal-direction mismatch while holding covariance eigenvalues fixed.
 
 ## Image experiment
 
@@ -26,7 +24,7 @@ The release readiness record remains `not_run` until the exact cluster environme
 ```text
 .
 ├── .github/              # module-specific continuous integration
-├── gmm_simulation/       # synthetic Gaussian-mixture pipeline
+├── gmm_simulation/       # original AR(1) and spectrum-rotation studies
 ├── image_experiment/     # real-image transfer pipeline
 └── README.md             # repository navigation
 ```
