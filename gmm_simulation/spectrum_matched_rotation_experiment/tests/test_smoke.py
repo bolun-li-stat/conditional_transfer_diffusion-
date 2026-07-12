@@ -8,4 +8,4 @@ def test_smoke_training(tmp_path: Path):
     joint = run_setting(cfg, "joint_conditional", skip_generation=True)
     assert target["model_type"] == "target_only"
     assert joint["model_type"] == "joint_conditional"
-    assert (tmp_path / "metrics.csv").exists()
+    assert (tmp_path / "metrics/seed_000.csv").exists()

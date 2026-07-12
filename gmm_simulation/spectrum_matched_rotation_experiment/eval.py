@@ -14,7 +14,8 @@ def epsilon_mse(model, diffusion, x: np.ndarray, seed: int, batch_size: int = 51
         eps = torch.randn(part.shape, device=diffusion.device, generator=gen)
         noisy = diffusion.q_sample(part, t, eps)
         labels = torch.zeros(len(part), dtype=torch.long, device=diffusion.device)
-        values.append(((model(noisy, t, labels)-eps)**2).sum(1).cpu())
+        squared_error = (model(noisy, t, labels) - eps).pow(2)
+        values.append(squared_error.mean(dim=1).cpu())
     return float(torch.cat(values).mean())
 
 
@@ -67,13 +68,21 @@ def mismatch_diagnostics(target: np.ndarray, auxiliaries: list[np.ndarray], alph
 
 def gradient_alignment(model, diffusion, class_arrays: list[np.ndarray], seed: int,
                        batch_size: int) -> tuple[float, float, float]:
-    gradients = []
+    if any(len(array) < batch_size for array in class_arrays):
+        raise ValueError("Each class array must contain at least batch_size rows.")
+    generator = torch.Generator(device=diffusion.device).manual_seed(seed)
+    timesteps = torch.randint(diffusion.T, (batch_size,), device=diffusion.device,
+                              generator=generator)
+    noise = torch.randn((batch_size, class_arrays[0].shape[1]),
+                        device=diffusion.device, generator=generator)
+    gradients: list[torch.Tensor] = []
     for label, array in enumerate(class_arrays):
-        gen = torch.Generator(device=diffusion.device).manual_seed(seed + label)
         x = torch.as_tensor(array[:batch_size], device=diffusion.device)
         labels = torch.full((len(x),), label, device=diffusion.device, dtype=torch.long)
         model.zero_grad(set_to_none=True)
-        loss = diffusion.loss(model, x, labels, gen)
+        noisy = diffusion.q_sample(x, timesteps, noise)
+        prediction = model(noisy, timesteps, labels)
+        loss = torch.nn.functional.mse_loss(prediction, noise)
         grads = torch.autograd.grad(loss, model.shared_parameters())
         gradients.append(torch.cat([g.detach().flatten() for g in grads]))
     cos = lambda a, b: float(torch.nn.functional.cosine_similarity(a, b, dim=0).cpu())
