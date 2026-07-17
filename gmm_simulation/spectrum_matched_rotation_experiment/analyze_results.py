@@ -18,6 +18,13 @@ METRICS = {
     "validation_epsilon_mse": "gap_val_epsilon",
     "gaussian_w2_squared": "gap_w2",
 }
+THREE_MODEL_METRICS = [*METRICS.keys(), "mean_error", "covariance_error"]
+THREE_MODEL_COMPARISONS = {
+    "joint_conditional_minus_unconditional": ("joint_conditional", "unconditional"),
+    "joint_conditional_minus_target_only_conditional": (
+        "joint_conditional", "target_only"),
+    "target_only_conditional_minus_unconditional": ("target_only", "unconditional"),
+}
 DIAGNOSTICS = ["grad_cos_target_aux1_init", "grad_cos_target_aux2_init",
                "grad_cos_target_aux_mean_init", "covariance_distance",
                "noised_score_map_distance"]
@@ -59,6 +66,96 @@ def pair_metrics(metrics: pd.DataFrame) -> pd.DataFrame:
     for column in DIAGNOSTICS:
         out[column] = paired[f"{column}_joint"]
     return out
+
+
+def pair_three_models(metrics: pd.DataFrame) -> pd.DataFrame:
+    """Return long-form gaps while retaining unavailable comparisons as NaN."""
+    required = {"design_id", "pair_id", "setting_id", "model_type",
+                "rotation_deg", "seed", "capacity"}
+    missing = required - set(metrics)
+    if missing:
+        raise ValueError(f"Metrics missing pairing columns: {sorted(missing)}")
+    baselines = metrics[metrics.model_type.isin(["target_only", "unconditional"])]
+    duplicated = baselines.duplicated(["pair_id", "model_type"], keep=False)
+    if duplicated.any():
+        raise ValueError("Each pair_id requires at most one row per angle-independent baseline")
+    joint = metrics[metrics.model_type == "joint_conditional"]
+    if joint.duplicated(["pair_id", "rotation_deg"], keep=False).any():
+        raise ValueError("Each pair_id/rotation requires exactly one joint row")
+    rows: list[dict[str, object]] = []
+    for _, joint_row in joint.iterrows():
+        same_pair = metrics[metrics.pair_id.astype(str) == str(joint_row.pair_id)]
+        models = {str(row.model_type): row for _, row in same_pair.iterrows()
+                  if row.model_type != "joint_conditional"}
+        models["joint_conditional"] = joint_row
+        for comparison, (left, right) in THREE_MODEL_COMPARISONS.items():
+            has_models = left in models and right in models
+            for metric in THREE_MODEL_METRICS:
+                if metric not in metrics:
+                    continue
+                gap = np.nan
+                if has_models:
+                    left_value, right_value = models[left][metric], models[right][metric]
+                    if pd.notna(left_value) and pd.notna(right_value):
+                        gap = float(left_value) - float(right_value)
+                rows.append({"design_id": joint_row.design_id,
+                             "pair_id": joint_row.pair_id,
+                             "seed": int(joint_row.seed),
+                             "capacity": joint_row.capacity,
+                             "rotation_deg": joint_row.rotation_deg,
+                             "comparison": comparison, "metric": metric,
+                             "gap": gap, "models_available": has_models})
+    paired = pd.DataFrame(rows)
+    if paired.empty:
+        return paired
+    index = ["design_id", "pair_id", "seed", "capacity", "rotation_deg", "metric"]
+    wide = paired.pivot(index=index, columns="comparison", values="gap")
+    names = list(THREE_MODEL_COMPARISONS)
+    if all(name in wide for name in names):
+        complete = wide[names].notna().all(axis=1)
+        if complete.any() and not np.allclose(
+            wide.loc[complete, names[0]],
+            wide.loc[complete, names[1]] + wide.loc[complete, names[2]],
+            rtol=1e-10, atol=1e-12):
+            raise ValueError("Three-model gap identity failed")
+    return paired
+
+
+def summarize_three_models(
+    paired: pd.DataFrame, expected_seeds: Iterable[int] = range(20),
+) -> pd.DataFrame:
+    expected = {int(seed) for seed in expected_seeds}
+    if not expected:
+        raise ValueError("expected_seeds cannot be empty")
+    rows: list[dict[str, object]] = []
+    grouping = ["design_id", "capacity", "rotation_deg", "comparison", "metric"]
+    for values, group in paired.groupby(grouping, sort=True):
+        base = dict(zip(grouping, values))
+        available = group.dropna(subset=["gap"])
+        observed = {int(seed) for seed in available.seed.unique()}
+        gaps = available.gap.to_numpy(dtype=float)
+        n = len(gaps)
+        mean = float(gaps.mean()) if n else np.nan
+        se = float(gaps.std(ddof=1) / np.sqrt(n)) if n > 1 else np.nan
+        critical = float(student_t.ppf(.975, n - 1)) if n > 1 else np.nan
+        lo, hi = ((mean - critical * se, mean + critical * se)
+                  if n > 1 else (np.nan, np.nan))
+        complete = observed == expected and n == len(expected)
+        sample_metric = base["metric"] in {"gaussian_w2_squared", "mean_error",
+                                            "covariance_error"}
+        status = ("incomplete" if not complete else "positive" if hi < 0
+                  else "negative" if lo > 0 else "inconclusive")
+        rows.append({**base, "expected_n": len(expected), "observed_n": n,
+                     "missing_seeds": ";".join(map(str, sorted(expected - observed))),
+                     "paired_mean": mean, "standard_error": se,
+                     "ci95_low": lo, "ci95_high": hi,
+                     "n_gap_lt_zero": int((gaps < 0).sum()),
+                     "n_gap_gt_zero": int((gaps > 0).sum()),
+                     "completeness": "complete" if complete else "incomplete",
+                     "score_transfer_status": (status if base["metric"].endswith("score_risk") else ""),
+                     "sample_transfer_status": (status if sample_metric else ""),
+                     "diagnostic_status": (status if not sample_metric and not base["metric"].endswith("score_risk") else "")})
+    return pd.DataFrame(rows)
 
 
 def _status_column(metric: str) -> str:
@@ -169,6 +266,65 @@ def _latex_table(summary: pd.DataFrame, path: Path) -> None:
                                                         float_format="%.4g")
 
 
+def _three_model_line(paired: pd.DataFrame, metric: str, comparison: str,
+                      path: Path) -> None:
+    data = paired[(paired.metric == metric) & (paired.comparison == comparison)]
+    plt.figure(figsize=(7, 4.5))
+    plotted = False
+    for (design, capacity), group in data.groupby(["design_id", "capacity"]):
+        records = []
+        for rotation, values in group.groupby("rotation_deg"):
+            gaps = values.gap.dropna().to_numpy(dtype=float)
+            if not len(gaps):
+                continue
+            se = float(gaps.std(ddof=1) / np.sqrt(len(gaps))) if len(gaps) > 1 else 0.0
+            critical = float(student_t.ppf(.975, len(gaps) - 1)) if len(gaps) > 1 else 0.0
+            records.append((rotation, float(gaps.mean()), critical * se))
+        if records:
+            frame = pd.DataFrame(records, columns=["rotation", "mean", "half_width"])
+            plt.errorbar(frame.rotation, frame["mean"], yerr=frame.half_width,
+                         marker="o", label=f"{capacity}/{design[:8]}")
+            plotted = True
+    plt.axhline(0, color="black", linewidth=.8)
+    plt.xlabel("Rotation (degrees)"); plt.ylabel(f"{metric} gap")
+    if plotted:
+        plt.legend(fontsize=7)
+    else:
+        plt.text(.5, .5, "Comparison unavailable", ha="center", va="center",
+                 transform=plt.gca().transAxes)
+    plt.tight_layout(); plt.savefig(path, dpi=180); plt.close()
+
+
+def write_three_model_outputs(metrics: pd.DataFrame, results_dir: Path,
+                              expected_seeds: Iterable[int]) \
+        -> tuple[pd.DataFrame, pd.DataFrame]:
+    paired = pair_three_models(metrics)
+    summary = summarize_three_models(paired, expected_seeds)
+    paired.to_csv(results_dir / "paired_three_model_gaps.csv", index=False)
+    summary.to_csv(results_dir / "summary_three_model_gaps.csv", index=False)
+    tables, figures = results_dir / "tables", results_dir / "figures"
+    tables.mkdir(exist_ok=True); figures.mkdir(exist_ok=True)
+    primary = summary[
+        summary.comparison == "joint_conditional_minus_unconditional"]
+    primary.to_latex(tables / "rotation_primary_unconditional_summary.tex",
+                     index=False, float_format="%.4g")
+    summary.to_latex(tables / "rotation_three_model_summary.tex", index=False,
+                     float_format="%.4g")
+    figure_specs = [
+        ("score_risk", "joint_conditional_minus_unconditional",
+         "score_gap_joint_minus_unconditional.png"),
+        ("gaussian_w2_squared", "joint_conditional_minus_unconditional",
+         "w2_gap_joint_minus_unconditional.png"),
+        ("score_risk", "target_only_conditional_minus_unconditional",
+         "parameterization_score_gap.png"),
+        ("gaussian_w2_squared", "target_only_conditional_minus_unconditional",
+         "parameterization_w2_gap.png"),
+    ]
+    for metric, comparison, filename in figure_specs:
+        _three_model_line(paired, metric, comparison, figures / filename)
+    return paired, summary
+
+
 def analyze(results_dir: Path, expected_seeds: Iterable[int] = range(20),
             selected_design_id: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     metrics = consolidate_seed_metrics(results_dir)
@@ -179,7 +335,27 @@ def analyze(results_dir: Path, expected_seeds: Iterable[int] = range(20),
         metrics = metrics[metrics.design_id.astype(str) == selected_design_id]
         manifest = manifest[manifest.design_id.astype(str) == selected_design_id]
     manifest.to_csv(results_dir / "design_manifest.csv", index=False)
-    paired = pair_metrics(metrics); summary = summarize(paired, expected_seeds)
+    # Keep pair_metrics strict and unchanged, but omit joint rows whose historical
+    # C_T baseline is absent so the additive three-model analysis can still run.
+    target_counts = (metrics[metrics.model_type == "target_only"]
+                     .groupby("pair_id").size())
+    valid_pair_ids = set(target_counts[target_counts == 1].index.astype(str))
+    legacy_metrics = metrics[
+        (metrics.model_type == "target_only")
+        | ((metrics.model_type == "joint_conditional")
+           & metrics.pair_id.astype(str).isin(valid_pair_ids))]
+    if (legacy_metrics.model_type == "joint_conditional").any():
+        paired = pair_metrics(legacy_metrics)
+        summary = summarize(paired, expected_seeds)
+    else:
+        paired = pd.DataFrame(columns=["design_id", "pair_id", "seed", "capacity",
+                                       "rotation_deg", *METRICS.values(), *DIAGNOSTICS])
+        summary = pd.DataFrame(columns=[
+            "design_id", "capacity", "rotation_deg", "metric", "expected_n",
+            "observed_n", "n_available", "missing_seeds", "extra_seeds",
+            "mean_gap", "standard_error", "ci95_low", "ci95_high",
+            "n_gap_lt_zero", "n_gap_gt_zero", "score_transfer_status",
+            "sample_transfer_status", "diagnostic_status"])
     paired.to_csv(results_dir / "paired_gaps.csv", index=False)
     summary.to_csv(results_dir / "summary_by_angle_capacity.csv", index=False)
     tables, figures = results_dir / "tables", results_dir / "figures"
@@ -204,6 +380,7 @@ def analyze(results_dir: Path, expected_seeds: Iterable[int] = range(20),
           "Initial shared-gradient cosine", figures / "gradient_cosine.png")
     _line(paired, ["covariance_distance", "noised_score_map_distance"],
           "Mismatch distance", figures / "mismatch_distances.png")
+    write_three_model_outputs(metrics, results_dir, expected_seeds)
     return paired, summary
 
 

@@ -15,9 +15,17 @@ from data import build_paired_split, covariance_family
 from diffusion import DDPM
 from eval import (epsilon_mse, generated_metrics, gradient_alignment,
                   mismatch_diagnostics, score_risk)
+from unconditional_model import LabelIgnoringAdapter, UnconditionalDenoiser
 from utils import (checkpoint_id, device_from_name, identity_payload,
                    read_seed_metrics, setting_id, training_design_id,
                    upsert_seed_metric)
+
+
+LEGACY_MODEL_TYPES = ("target_only", "joint_conditional")
+NEW_MODEL_TYPE = "unconditional"
+ALL_MODEL_TYPES = (*LEGACY_MODEL_TYPES, NEW_MODEL_TYPE)
+UNCONDITIONAL_MODEL_SEED_OFFSET = 90_031
+UNCONDITIONAL_TRAINING_SEED_OFFSET = 90_032
 
 
 def _model(cfg: ExperimentConfig) -> ConditionalDenoiser:
@@ -25,6 +33,12 @@ def _model(cfg: ExperimentConfig) -> ConditionalDenoiser:
     return ConditionalDenoiser(cfg.d, cfg.K, cap.time_embedding_dim,
                                cap.class_embedding_dim, cap.hidden_width,
                                cap.hidden_layers)
+
+
+def _unconditional_model(cfg: ExperimentConfig) -> LabelIgnoringAdapter:
+    cap = CAPACITIES[cfg.capacity]
+    return LabelIgnoringAdapter(UnconditionalDenoiser(
+        cfg.d, cap.time_embedding_dim, cap.hidden_width, cap.hidden_layers))
 
 
 def _balanced_batch(x: torch.Tensor, y: torch.Tensor, batch: int,
@@ -113,10 +127,172 @@ def load_completed_model(cfg: ExperimentConfig, model_type: str,
     return model, float(saved["final_loss"]), checkpoint
 
 
+def train_unconditional(
+    cfg: ExperimentConfig,
+    target_train: np.ndarray,
+    diffusion: DDPM,
+    resume: bool,
+) -> tuple[LabelIgnoringAdapter, float, Path]:
+    """Independent target-only unconditional path; legacy trainers are untouched."""
+    _, checkpoint = _checkpoint_path(cfg, NEW_MODEL_TYPE)
+    torch.manual_seed(cfg.seed + UNCONDITIONAL_MODEL_SEED_OFFSET)
+    model = _unconditional_model(cfg).to(diffusion.device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
+    start, saved_generator_state = 0, None
+    final_loss = float("nan")
+    if resume and checkpoint.exists():
+        saved = torch.load(checkpoint, map_location=diffusion.device)
+        model.load_state_dict(saved["model"])
+        optimizer.load_state_dict(saved["optimizer"])
+        start = int(saved["step"])
+        saved_generator_state = saved.get("generator_state")
+        if "final_loss" in saved:
+            final_loss = float(saved["final_loss"])
+        elif start >= cfg.training_steps:
+            raise ValueError(
+                f"Completed checkpoint {checkpoint} lacks final_loss; rerun training explicitly.")
+    x = torch.as_tensor(target_train, device=diffusion.device)
+    generator = torch.Generator(device=diffusion.device).manual_seed(
+        cfg.seed + UNCONDITIONAL_TRAINING_SEED_OFFSET)
+    if saved_generator_state is not None:
+        generator.set_state(saved_generator_state)
+    for step in range(start, cfg.training_steps):
+        index = torch.randint(len(x), (cfg.batch_size,), device=x.device,
+                              generator=generator)
+        xb = x[index]
+        # The adapter discards this API placeholder; its core has no label input.
+        ignored = torch.zeros(len(xb), dtype=torch.long, device=x.device)
+        optimizer.zero_grad(set_to_none=True)
+        loss = diffusion.loss(model, xb, ignored, generator)
+        loss.backward()
+        optimizer.step()
+        final_loss = float(loss.detach())
+        if (step + 1) % 1000 == 0:
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                        "step": step + 1, "generator_state": generator.get_state(),
+                        "final_loss": final_loss}, checkpoint)
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                "step": cfg.training_steps, "generator_state": generator.get_state(),
+                "final_loss": final_loss}, checkpoint)
+    return model, final_loss, checkpoint
+
+
+def load_completed_unconditional(
+    cfg: ExperimentConfig, device: torch.device,
+) -> tuple[LabelIgnoringAdapter, float, Path]:
+    _, checkpoint = _checkpoint_path(cfg, NEW_MODEL_TYPE)
+    if not checkpoint.exists():
+        raise FileNotFoundError(f"Generation-only requires checkpoint: {checkpoint}")
+    saved = torch.load(checkpoint, map_location=device)
+    step = int(saved.get("step", -1))
+    if step != cfg.training_steps:
+        raise ValueError(
+            f"Checkpoint {checkpoint} is incomplete: step={step}, expected={cfg.training_steps}")
+    if "final_loss" not in saved:
+        raise ValueError(f"Completed checkpoint {checkpoint} lacks final_loss")
+    model = _unconditional_model(cfg).to(device)
+    model.load_state_dict(saved["model"])
+    return model, float(saved["final_loss"]), checkpoint
+
+
 def _setting_identity(cfg: ExperimentConfig, model_type: str) -> tuple[dict[str, Any], str]:
     identity = identity_payload(cfg)
     sid = setting_id(identity["pair_id"], model_type, cfg.rotation_deg)
     return identity, sid
+
+
+def _unconditional_generation_only(
+    cfg: ExperimentConfig, family, diffusion: DDPM,
+) -> dict[str, Any]:
+    identity, sid = _setting_identity(cfg, NEW_MODEL_TYPE)
+    existing = read_seed_metrics(cfg.results_dir, cfg.seed)
+    matches = existing[existing.setting_id.astype(str) == sid] if not existing.empty else existing
+    if len(matches) != 1:
+        raise ValueError(
+            f"Generation-only requires exactly one existing score row for setting_id={sid}")
+    model, final_loss, checkpoint = load_completed_unconditional(cfg, diffusion.device)
+    evaluation_seed = cfg.seed + 70_027
+    generated = diffusion.sample(model, cfg.n_generated, cfg.d, 0,
+                                 evaluation_seed + 2).numpy()
+    row = matches.iloc[0].to_dict()
+    row.update(generated_metrics(generated, family.target))
+    row.update({"training_complete": True, "score_evaluation_complete": True,
+                "generation_evaluation_complete": True,
+                "final_train_loss": final_loss, "checkpoint_path": str(checkpoint),
+                **identity, "setting_id": sid})
+    upsert_seed_metric(row, cfg.results_dir)
+    return row
+
+
+def run_unconditional_setting(
+    cfg: ExperimentConfig, skip_generation: bool = False, resume: bool = False,
+    force: bool = False, generation_only: bool = False,
+) -> dict[str, Any]:
+    """Run U_T without constructing, loading, or evaluating either legacy model."""
+    cfg.validate()
+    cfg.results_dir.mkdir(parents=True, exist_ok=True)
+    identity, sid = _setting_identity(cfg, NEW_MODEL_TYPE)
+    existing = read_seed_metrics(cfg.results_dir, cfg.seed)
+    if (not generation_only and not force and not existing.empty
+            and sid in existing["setting_id"].astype(str).values):
+        return {}
+    split = build_paired_split(
+        cfg.d, cfg.seed, cfg.rotation_deg, cfg.n_target_train, cfg.n_aux_train,
+        cfg.n_validation, cfg.n_test, cfg.spectrum.lambda_high,
+        cfg.spectrum.lambda_low)
+    family = covariance_family(
+        cfg.d, cfg.seed, cfg.rotation_deg, cfg.spectrum.lambda_high,
+        cfg.spectrum.lambda_low)
+    reference = covariance_family(
+        cfg.d, cfg.seed, 0, cfg.spectrum.lambda_high,
+        cfg.spectrum.lambda_low).target
+    assert np.array_equal(family.target, reference), "target covariance changed with rotation"
+    device = device_from_name(cfg.device)
+    diffusion = DDPM(cfg.T, cfg.beta_start, cfg.beta_end, device)
+    if generation_only:
+        return _unconditional_generation_only(cfg, family, diffusion)
+    model, final_loss, checkpoint = train_unconditional(
+        cfg, split["target_train"], diffusion, resume)
+    evaluation_seed = cfg.seed + 70_027
+    risks = {"score_risk": score_risk(
+        model, diffusion, family.target, cfg.score_risk_mc_samples,
+        evaluation_seed)}
+    bins = {"low_noise_score_risk": (0, min(100, cfg.T)),
+            "mid_noise_score_risk": (min(100, cfg.T), min(500, cfg.T)),
+            "high_noise_score_risk": (min(500, cfg.T), cfg.T)}
+    for name, bounds in bins.items():
+        risks[name] = (score_risk(
+            model, diffusion, family.target, cfg.score_risk_mc_samples,
+            evaluation_seed + 1, bounds)
+            if bounds[0] < bounds[1] else np.nan)
+    generation_metrics = {"gaussian_w2_squared": np.nan, "mean_error": np.nan,
+                          "covariance_error": np.nan}
+    if not skip_generation:
+        generated = diffusion.sample(
+            model, cfg.n_generated, cfg.d, 0, evaluation_seed + 2).numpy()
+        generation_metrics = generated_metrics(generated, family.target)
+    cid, _ = _checkpoint_path(cfg, NEW_MODEL_TYPE)
+    row: dict[str, Any] = {
+        **identity, "checkpoint_id": cid, "setting_id": sid,
+        "model_type": NEW_MODEL_TYPE, "rotation_deg": np.nan,
+        "target_covariance_seed": cfg.seed, **risks,
+        "validation_epsilon_mse": epsilon_mse(
+            model, diffusion, split["target_val"], evaluation_seed + 3,
+            cfg.batch_size),
+        **generation_metrics,
+        "grad_cos_target_aux1_init": np.nan,
+        "grad_cos_target_aux2_init": np.nan,
+        "grad_cos_target_aux_mean_init": np.nan,
+        "covariance_distance": np.nan,
+        "noised_score_map_distance": np.nan,
+        "final_train_loss": final_loss, "checkpoint_path": str(checkpoint),
+        "training_complete": True, "score_evaluation_complete": True,
+        "generation_evaluation_complete": not skip_generation,
+    }
+    upsert_seed_metric(row, cfg.results_dir)
+    return row
 
 
 def _generation_only(cfg: ExperimentConfig, model_type: str,
@@ -144,6 +320,9 @@ def _generation_only(cfg: ExperimentConfig, model_type: str,
 def run_setting(cfg: ExperimentConfig, model_type: str,
                 skip_generation: bool = False, resume: bool = False,
                 force: bool = False, generation_only: bool = False) -> dict[str, Any]:
+    if model_type == NEW_MODEL_TYPE:
+        return run_unconditional_setting(
+            cfg, skip_generation, resume, force, generation_only)
     cfg.validate(); cfg.results_dir.mkdir(parents=True, exist_ok=True)
     identity, sid = _setting_identity(cfg, model_type)
     existing = read_seed_metrics(cfg.results_dir, cfg.seed)
@@ -235,11 +414,29 @@ def parse_args() -> argparse.Namespace:
     stage.add_argument("--generation-only", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--model-types", nargs="+", choices=[*ALL_MODEL_TYPES, "all"],
+        help="Models to execute. Omitted preserves the legacy target-only/joint run.")
     return parser.parse_args()
+
+
+def normalize_model_types(values: list[str] | None) -> tuple[str, ...]:
+    if values is None:
+        return LEGACY_MODEL_TYPES
+    if "all" in values:
+        if len(values) != 1:
+            raise ValueError("--model-types all cannot be combined with other values")
+        return ALL_MODEL_TYPES
+    unknown = set(values) - set(ALL_MODEL_TYPES)
+    if unknown:
+        raise ValueError(f"Unsupported --model-types: {sorted(unknown)}")
+    selected = set(values)
+    return tuple(model for model in ALL_MODEL_TYPES if model in selected)
 
 
 def main() -> None:
     args = parse_args(); results = Path(args.results_dir)
+    selected = normalize_model_types(args.model_types)
     capacities = list(CAPACITIES) if args.capacity == "all" else [args.capacity]
     if args.experiment == "smoke":
         cfg = smoke_config(results)
@@ -259,12 +456,23 @@ def main() -> None:
                 setattr(cfg, name, value)
         cfg.device = args.device
         target_key = (training_design_id(cfg), cfg.seed)
-        if target_key not in completed_target:
+        if "target_only" in selected and target_key not in completed_target:
             run_setting(cfg, "target_only", args.skip_generation, args.resume,
                         args.force, args.generation_only)
             completed_target.add(target_key)
-        run_setting(cfg, "joint_conditional", args.skip_generation, args.resume,
-                    args.force, args.generation_only)
+        if "joint_conditional" in selected:
+            run_setting(cfg, "joint_conditional", args.skip_generation, args.resume,
+                        args.force, args.generation_only)
+    if NEW_MODEL_TYPE in selected:
+        completed_unconditional: set[tuple[str, int]] = set()
+        for cfg in configs:
+            key = (training_design_id(cfg), cfg.seed)
+            if key in completed_unconditional:
+                continue
+            run_unconditional_setting(
+                cfg, args.skip_generation, args.resume, args.force,
+                args.generation_only)
+            completed_unconditional.add(key)
 
 
 if __name__ == "__main__":
