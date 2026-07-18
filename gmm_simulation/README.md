@@ -29,3 +29,18 @@ legacy model set, order, identities, checkpoints, and results. Existing
 checkpoints need not be retrained; either new model can be run alone into an
 existing results directory. Analyses retain computable comparisons and mark
 comparisons with a missing estimator incomplete.
+
+Both modules have independent hosted GMM test jobs. Exact tiny-CPU legacy
+non-regression can be reproduced from the repository root with:
+
+```bash
+git worktree add --detach /tmp/gmm-base <BASE_COMMIT_SHA>
+python gmm_simulation/tests/golden_regression.py \
+  --base-worktree /tmp/gmm-base \
+  --modified-worktree .
+git worktree remove /tmp/gmm-base
+```
+
+The runner covers both Original legacy experiments and the Rotation legacy
+pair, compares loaded model/optimizer/generator states, logs, metrics, IDs,
+configs, and saved arrays, prints a JSON summary, and removes its tiny results.

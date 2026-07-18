@@ -179,8 +179,26 @@ python analyze_three_models.py --results-dir <EXISTING_RESULTS_DIR>
 ```
 
 It writes `paired_three_model_gaps.csv`, `summary_three_model_gaps.csv`, a LaTeX
-table, and score/W2 gap figures. Comparisons are paired by seed and complete
-scientific setting before averaging. `C_J-U_T` is the primary paper comparison,
+table, and separate score/W2 gap figures for `low_target_data` and
+`same_total_budget`. Comparisons are paired by seed and complete scientific
+setting before averaging. The paired CSV retains each seed's realized
+`auxiliary_rhos` for auditability; the cross-seed summary excludes that realized
+field and groups class-varying designs by `mismatch_level`. Thus all expected
+seeds for one mismatch level contribute to the same summary group.
+
+The four formal figures are:
+
+```text
+figures/low_target_data_three_model_score_gaps.png
+figures/low_target_data_three_model_w2_gaps.png
+figures/same_total_budget_three_model_score_gaps.png
+figures/same_total_budget_three_model_w2_gaps.png
+```
+
+Curves are separated by comparison, covariance scenario, and covariance setting
+(`rho=<value>` or `mismatch=<level>`). Error bars use the paired Student-t 95%
+intervals stored in the summary, not a normal approximation. `C_J-U_T` is the
+primary paper comparison,
 `C_J-C_T` is the architecture-matched auxiliary-training comparison, and
 `C_T-U_T` is the architecture/parameterization gap. A negative gap favors the
 first model. Missing `C_T` rows leave the historical `C_J-U_T` comparison
@@ -231,6 +249,11 @@ the old sequential checkpoint. Exact numerical regression is required in the
 same CPU environment and dependency versions. GPU/CUDA library nondeterminism
 precludes a claim of bitwise equality across hardware, CUDA, or PyTorch versions;
 the legacy GPU code path, seeds, and algorithm selection remain unchanged.
+
+The Original module has its own hosted `gmm-original-ar1-tests` CI job. To
+reproduce the base-versus-head tiny CPU golden comparison, use the versioned
+runner documented in `gmm_simulation/README.md`; no `/tmp`-only helper or saved
+baseline artifact is required.
 
 ## Google Colab instructions
 

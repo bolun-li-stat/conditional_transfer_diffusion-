@@ -25,6 +25,17 @@ THREE_MODEL_COMPARISONS = {
         "joint_conditional", "target_only"),
     "target_only_conditional_minus_unconditional": ("target_only", "unconditional"),
 }
+THREE_MODEL_PAIRED_COLUMNS = [
+    "design_id", "pair_id", "seed", "capacity", "rotation_deg",
+    "comparison", "metric", "gap", "models_available",
+]
+THREE_MODEL_SUMMARY_COLUMNS = [
+    "design_id", "capacity", "rotation_deg", "comparison", "metric",
+    "expected_n", "observed_n", "missing_seeds", "paired_mean",
+    "standard_error", "ci95_low", "ci95_high", "n_gap_lt_zero",
+    "n_gap_gt_zero", "completeness", "score_transfer_status",
+    "sample_transfer_status", "diagnostic_status",
+]
 DIAGNOSTICS = ["grad_cos_target_aux1_init", "grad_cos_target_aux2_init",
                "grad_cos_target_aux_mean_init", "covariance_distance",
                "noised_score_map_distance"]
@@ -105,7 +116,7 @@ def pair_three_models(metrics: pd.DataFrame) -> pd.DataFrame:
                              "rotation_deg": joint_row.rotation_deg,
                              "comparison": comparison, "metric": metric,
                              "gap": gap, "models_available": has_models})
-    paired = pd.DataFrame(rows)
+    paired = pd.DataFrame(rows, columns=THREE_MODEL_PAIRED_COLUMNS)
     if paired.empty:
         return paired
     index = ["design_id", "pair_id", "seed", "capacity", "rotation_deg", "metric"]
@@ -127,6 +138,8 @@ def summarize_three_models(
     expected = {int(seed) for seed in expected_seeds}
     if not expected:
         raise ValueError("expected_seeds cannot be empty")
+    if paired.empty:
+        return pd.DataFrame(columns=THREE_MODEL_SUMMARY_COLUMNS)
     rows: list[dict[str, object]] = []
     grouping = ["design_id", "capacity", "rotation_deg", "comparison", "metric"]
     for values, group in paired.groupby(grouping, sort=True):
@@ -140,9 +153,8 @@ def summarize_three_models(
         critical = float(student_t.ppf(.975, n - 1)) if n > 1 else np.nan
         lo, hi = ((mean - critical * se, mean + critical * se)
                   if n > 1 else (np.nan, np.nan))
-        complete = observed == expected and n == len(expected)
-        sample_metric = base["metric"] in {"gaussian_w2_squared", "mean_error",
-                                            "covariance_error"}
+        complete = observed == expected and n == len(expected) and n > 1
+        family = metric_status_family(str(base["metric"]))
         status = ("incomplete" if not complete else "positive" if hi < 0
                   else "negative" if lo > 0 else "inconclusive")
         rows.append({**base, "expected_n": len(expected), "observed_n": n,
@@ -152,10 +164,21 @@ def summarize_three_models(
                      "n_gap_lt_zero": int((gaps < 0).sum()),
                      "n_gap_gt_zero": int((gaps > 0).sum()),
                      "completeness": "complete" if complete else "incomplete",
-                     "score_transfer_status": (status if base["metric"].endswith("score_risk") else ""),
-                     "sample_transfer_status": (status if sample_metric else ""),
-                     "diagnostic_status": (status if not sample_metric and not base["metric"].endswith("score_risk") else "")})
-    return pd.DataFrame(rows)
+                     "score_transfer_status": status if family == "score" else "",
+                     "sample_transfer_status": status if family == "sample" else "",
+                     "diagnostic_status": status if family == "diagnostic" else ""})
+    return pd.DataFrame(rows, columns=THREE_MODEL_SUMMARY_COLUMNS)
+
+
+def metric_status_family(metric: str) -> str:
+    if metric in {
+        "score_risk", "low_noise_score_risk", "mid_noise_score_risk",
+        "high_noise_score_risk",
+    }:
+        return "score"
+    if metric == "gaussian_w2_squared":
+        return "sample"
+    return "diagnostic"
 
 
 def _status_column(metric: str) -> str:

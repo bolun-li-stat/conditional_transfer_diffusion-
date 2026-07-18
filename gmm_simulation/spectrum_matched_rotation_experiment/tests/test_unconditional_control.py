@@ -3,9 +3,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
-from analyze_results import analyze, pair_three_models, summarize_three_models
+from analyze_results import (THREE_MODEL_PAIRED_COLUMNS,
+                             THREE_MODEL_SUMMARY_COLUMNS, analyze,
+                             metric_status_family, pair_three_models,
+                             summarize_three_models)
 from config import ExperimentConfig, smoke_config
 from train import (normalize_model_types, run_unconditional_setting,
                    train_unconditional)
@@ -145,6 +149,51 @@ def test_rotation_three_model_gaps_and_missing_unconditional():
     primary = missing[
         missing.comparison == "joint_conditional_minus_unconditional"]
     assert legacy.gap.notna().all() and primary.gap.isna().all()
+
+
+def test_rotation_metric_status_families_are_disjoint():
+    rows = []
+    for seed in (0, 1):
+        rows += [_row(seed, "unconditional", None, 3),
+                 _row(seed, "target_only", None, 2),
+                 _row(seed, "joint_conditional", 45, 1)]
+    summary = summarize_three_models(
+        pair_three_models(pd.DataFrame(rows)), expected_seeds=[0, 1])
+    expected = {
+        "score_risk": "score", "low_noise_score_risk": "score",
+        "gaussian_w2_squared": "sample", "validation_epsilon_mse": "diagnostic",
+        "mean_error": "diagnostic", "covariance_error": "diagnostic",
+    }
+    for metric, family in expected.items():
+        assert metric_status_family(metric) == family
+        row = summary[
+            (summary.metric == metric)
+            & (summary.comparison == "joint_conditional_minus_unconditional")
+        ].iloc[0]
+        statuses = {"score": row.score_transfer_status,
+                    "sample": row.sample_transfer_status,
+                    "diagnostic": row.diagnostic_status}
+        assert statuses[family]
+        assert all(not status for name, status in statuses.items() if name != family)
+
+
+@pytest.mark.parametrize("model", ["unconditional", "target_only",
+                                    "joint_conditional"])
+def test_analysis_single_model_directory_is_safe(tmp_path: Path, model: str):
+    rotation = 45 if model == "joint_conditional" else None
+    row = _row(0, model, rotation, 1)
+    for name in ("grad_cos_target_aux1_init", "grad_cos_target_aux2_init",
+                 "grad_cos_target_aux_mean_init", "covariance_distance",
+                 "noised_score_map_distance"):
+        row[name] = 0.0
+    upsert_seed_metric(row, tmp_path)
+    analyze(tmp_path, expected_seeds=[0])
+    paired = pd.read_csv(tmp_path / "paired_three_model_gaps.csv")
+    summary = pd.read_csv(tmp_path / "summary_three_model_gaps.csv")
+    assert list(paired.columns) == THREE_MODEL_PAIRED_COLUMNS
+    assert list(summary.columns) == THREE_MODEL_SUMMARY_COLUMNS
+    assert paired.gap.dropna().empty
+    assert summary.paired_mean.dropna().empty
 
 
 def test_analysis_runs_when_target_only_baseline_is_missing(tmp_path: Path):

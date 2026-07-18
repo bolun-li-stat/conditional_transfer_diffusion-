@@ -26,6 +26,9 @@ PAIR_KEYS = ["experiment_type", "covariance_scenario", "rho", "mismatch_level",
              "target_rho", "auxiliary_rhos", "sqrt_alpha_bar_T", "K", "d",
              "Delta", "n", "n_target_train", "n_aux_train", "seed",
              "sampling_mode", "training_steps"]
+SUMMARY_KEYS = [
+    key for key in PAIR_KEYS if key not in {"seed", "auxiliary_rhos"}
+]
 
 
 def pair_three_models(metrics: pd.DataFrame) -> pd.DataFrame:
@@ -66,7 +69,7 @@ def summarize_three_models(
     expected = {int(seed) for seed in expected_seeds}
     if not expected:
         raise ValueError("expected_seeds cannot be empty")
-    grouping = [key for key in PAIR_KEYS if key in paired and key != "seed"]
+    grouping = [key for key in SUMMARY_KEYS if key in paired]
     grouping += ["comparison", "metric"]
     rows: list[dict[str, object]] = []
     for values, group in paired.groupby(grouping, dropna=False, sort=True):
@@ -80,7 +83,7 @@ def summarize_three_models(
         critical = float(student_t.ppf(.975, n - 1)) if n > 1 else np.nan
         lo, hi = ((mean - critical * se, mean + critical * se)
                   if n > 1 else (np.nan, np.nan))
-        complete = observed == expected and n == len(expected)
+        complete = observed == expected and n == len(expected) and n > 1
         rows.append({**base, "paired_mean": mean, "standard_error": se,
                      "ci95_low": lo, "ci95_high": hi,
                      "n_gap_lt_zero": int((gaps < 0).sum()),
@@ -93,21 +96,70 @@ def summarize_three_models(
     return pd.DataFrame(rows)
 
 
-def _gap_plot(summary: pd.DataFrame, metric: str, path: Path) -> None:
-    data = summary[summary.metric == metric]
-    plt.figure(figsize=(9, 4.8))
+def _covariance_setting(row: pd.Series) -> str:
+    if row["covariance_scenario"] == "shared":
+        return f"rho={row['rho']}"
+    return f"mismatch={row['mismatch_level']}"
+
+
+def prepare_gap_plot_series(
+    summary: pd.DataFrame, experiment_type: str, metric: str,
+) -> list[dict[str, object]]:
+    """Prepare scientifically distinct curves and paired Student-t error bars."""
+    x_name = "n_target_train" if experiment_type == "low_target_data" else "n"
+    data = summary[
+        (summary.experiment_type == experiment_type) & (summary.metric == metric)
+    ].copy()
     if data.empty:
-        plt.text(.5, .5, "No paired values", ha="center", va="center")
+        return []
+    data["covariance_setting"] = data.apply(_covariance_setting, axis=1)
+    group_keys = ["comparison", "covariance_scenario", "covariance_setting"]
+    series: list[dict[str, object]] = []
+    for keys, group in data.groupby(group_keys, dropna=False, sort=True):
+        valid = group[
+            np.isfinite(group["paired_mean"])
+            & np.isfinite(group["ci95_low"])
+            & np.isfinite(group["ci95_high"])
+            & group[x_name].notna()
+        ].sort_values(x_name)
+        if valid.empty:
+            continue
+        comparison, scenario, setting = keys
+        series.append({
+            "label": f"{comparison} | {scenario} | {setting}",
+            "comparison": comparison,
+            "covariance_scenario": scenario,
+            "covariance_setting": setting,
+            "x_name": x_name,
+            "x": valid[x_name].to_numpy(dtype=float),
+            "mean": valid["paired_mean"].to_numpy(dtype=float),
+            "lower_error": (
+                valid["paired_mean"] - valid["ci95_low"]
+            ).to_numpy(dtype=float),
+            "upper_error": (
+                valid["ci95_high"] - valid["paired_mean"]
+            ).to_numpy(dtype=float),
+        })
+    return series
+
+
+def _gap_plot(summary: pd.DataFrame, experiment_type: str, metric: str,
+              path: Path) -> None:
+    series = prepare_gap_plot_series(summary, experiment_type, metric)
+    plt.figure(figsize=(9, 4.8))
+    if not series:
+        plt.text(.5, .5, "No available paired values", ha="center", va="center",
+                 transform=plt.gca().transAxes)
     else:
-        for comparison, group in data.groupby("comparison"):
-            x_name = "n" if group.get("n", pd.Series(dtype=float)).notna().any() else "n_target_train"
-            valid = group.dropna(subset=["paired_mean", x_name]).sort_values(x_name)
-            if not valid.empty:
-                plt.errorbar(valid[x_name], valid.paired_mean,
-                             yerr=1.96 * valid.standard_error.fillna(0), marker="o",
-                             label=comparison)
+        for curve in series:
+            plt.errorbar(
+                curve["x"], curve["mean"],
+                yerr=np.vstack([curve["lower_error"], curve["upper_error"]]),
+                marker="o", label=curve["label"])
         plt.axhline(0, color="black", linewidth=.8)
         plt.legend(fontsize=7)
+    x_name = "n_target_train" if experiment_type == "low_target_data" else "n"
+    plt.xlabel(x_name)
     plt.ylabel(f"Paired {metric} gap")
     plt.tight_layout()
     plt.savefig(path, dpi=180)
@@ -127,8 +179,13 @@ def analyze(results_dir: Path, expected_seeds: Iterable[int] = range(20)) \
     tables.mkdir(exist_ok=True); figures.mkdir(exist_ok=True)
     summary.to_latex(tables / "three_model_transfer_summary.tex", index=False,
                      float_format="%.4g")
-    _gap_plot(summary, "score_risk", figures / "three_model_score_gaps.png")
-    _gap_plot(summary, "gaussian_w2_squared", figures / "three_model_w2_gaps.png")
+    for experiment_type in ("low_target_data", "same_total_budget"):
+        _gap_plot(
+            summary, experiment_type, "score_risk",
+            figures / f"{experiment_type}_three_model_score_gaps.png")
+        _gap_plot(
+            summary, experiment_type, "gaussian_w2_squared",
+            figures / f"{experiment_type}_three_model_w2_gaps.png")
     return paired, summary
 
 

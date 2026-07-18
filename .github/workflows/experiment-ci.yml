@@ -10,6 +10,29 @@ on:
   workflow_dispatch:
 
 jobs:
+  gmm-original-ar1-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: gmm_simulation/original_ar1_experiment/requirements.txt
+      - name: Install original AR1 CPU dependencies
+        run: >-
+          cd gmm_simulation/original_ar1_experiment &&
+          python -m pip install -r requirements.txt pytest
+      - name: Compile
+        run: >-
+          cd gmm_simulation/original_ar1_experiment &&
+          python -m compileall -q .
+      - name: Original AR1 tests
+        run: >-
+          cd gmm_simulation/original_ar1_experiment &&
+          python -m pytest -q
+
   gmm-spectrum-rotation-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 15

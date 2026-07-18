@@ -150,6 +150,13 @@ sample completeness/status remain separate; no overall status is manufactured.
 If either baseline is absent, available comparisons are still produced and the
 others are incomplete.
 
+Endpoint status is deliberately narrow: integrated and noise-bin score risks
+populate `score_transfer_status`; only Gaussian W2 squared populates
+`sample_transfer_status`; validation epsilon MSE, mean error, and covariance
+error populate `diagnostic_status`. Directories containing only one estimator,
+or otherwise partial model sets, still produce header-bearing paired/summary
+CSVs and empty/incomplete outputs rather than failing.
+
 Existing model strings, design/training-design/pair/checkpoint/setting IDs,
 paths, checkpoints, and default commands are unchanged and do not need
 retraining. The exact compatibility guarantee covers legacy commands that omit
