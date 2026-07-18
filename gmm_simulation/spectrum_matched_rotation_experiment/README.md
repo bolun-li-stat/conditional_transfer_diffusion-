@@ -30,6 +30,16 @@ At `theta=0`, all distributions coincide, providing a positive-transfer control.
 
 Both `target_only` and `joint_conditional` use the same `ConditionalDenoiser`, three-class embedding table, initialization seed, and target samples. The target-only model always receives label 0. It is trained once per seed and capacity because it does not depend on rotation; analysis pairs that common baseline with each joint run before taking averages.
 
+A true target-only unconditional estimator is also available as the additive
+`model_type=unconditional`. Its `UnconditionalDenoiser.forward(x_t,t)` has no
+class embedding, label input, or label-dependent trainable parameters. A
+parameter-free label-ignoring adapter lets it reuse the frozen conditional DDPM
+loss, sampling, and evaluation APIs. It uses the exact `target_train` rows used
+by `target_only` and is trained only once per seed and capacity, with
+`rotation_deg=NaN`. The legacy `target_only`/`joint_conditional` shared-initial-
+state pairing is unchanged; the different unconditional architecture uses its
+own deterministic model-specific seed and is not claimed to share weights.
+
 ## Capacities and transfer endpoints
 
 The **standard** capacity (time embedding 64, class embedding 32, width 256,
@@ -68,6 +78,28 @@ python train.py --experiment full --capacity standard --seeds 0 1 2 3 4 \
 python analyze_results.py --results-dir results_rotation
 ```
 
+To add only the unconditional score-stage results to an existing directory:
+
+```bash
+python train.py --experiment full --capacity all \
+  --model-types unconditional --seeds 0 1 2 3 4 \
+  --results-dir <EXISTING_RESULTS_DIR> --skip-generation --resume
+```
+
+Then complete only those unconditional sample metrics with:
+
+```bash
+python train.py --experiment full --capacity all \
+  --model-types unconditional --seeds 0 1 2 3 4 \
+  --results-dir <EXISTING_RESULTS_DIR> --generation-only --resume
+```
+
+Neither command requires `target_only` or `joint_conditional` checkpoints or
+rows. Omitting `--model-types` still runs only the two legacy models in their
+historical order. `--model-types all` completes all legacy calls first, then the
+new unconditional calls; the new estimator is deduplicated across rotation
+angles.
+
 For Colab, run eight training shards: four standard-capacity shards and four
 limited-capacity shards, each covering `0..4`, `5..9`, `10..14`, or `15..19`.
 Each shard trains 5 reusable target-only and 15 joint models. A session therefore
@@ -94,7 +126,42 @@ Analysis groups by `design_id`, capacity, and rotation, so mixed pilot/formal or
 evaluation configurations cannot form a false 20-seed result. Score and sample
 completeness are assessed independently.
 
-The full prespecified grid remains 120 joint models plus 40 common target-only
-models (160 total). Generation evaluation may be deferred, but formal conclusions
-require all 20 seeds for both capacities. Generated samples are not saved by
-default; only aggregate metrics are written.
+The legacy prespecified grid remains 120 joint models plus 40 common target-only
+models (160 legacy models). Selecting all three adds 40 angle-independent
+unconditional models, for 200 total. Generation evaluation may be deferred, but
+formal conclusions require all 20 seeds for both capacities. Generated samples
+are not saved by default; only aggregate metrics are written.
+
+## Three-model interpretation and compatibility
+
+Here `U_T=unconditional`, `C_T=target_only`, and `C_J=joint_conditional`. The
+existing `gap_score`, `gap_w2`, `paired_gaps.csv`, and
+`summary_by_angle_capacity.csv` retain their historical `C_J-C_T` meaning.
+Additional outputs `paired_three_model_gaps.csv` and
+`summary_three_model_gaps.csv` report:
+
+- `joint_conditional_minus_unconditional` (`C_J-U_T`), the primary paper comparison;
+- `joint_conditional_minus_target_only_conditional` (`C_J-C_T`), the architecture-matched auxiliary-training comparison;
+- `target_only_conditional_minus_unconditional` (`C_T-U_T`), the architecture/parameterization gap.
+
+All metrics are lower-is-better, so negative favors the first named model. The
+three gaps are paired before averaging and checked for additivity. Score and
+sample completeness/status remain separate; no overall status is manufactured.
+If either baseline is absent, available comparisons are still produced and the
+others are incomplete.
+
+Endpoint status is deliberately narrow: integrated and noise-bin score risks
+populate `score_transfer_status`; only Gaussian W2 squared populates
+`sample_transfer_status`; validation epsilon MSE, mean error, and covariance
+error populate `diagnostic_status`. Directories containing only one estimator,
+or otherwise partial model sets, still produce header-bearing paired/summary
+CSVs and empty/incomplete outputs rather than failing.
+
+Existing model strings, design/training-design/pair/checkpoint/setting IDs,
+paths, checkpoints, and default commands are unchanged and do not need
+retraining. The exact compatibility guarantee covers legacy commands that omit
+`--model-types`; new subset-only commands did not previously exist and may skip
+historical RNG consumption. Same-environment CPU regression is exact. The code
+does not claim bitwise equivalence across GPU models, CUDA libraries, or PyTorch
+versions because those layers can be nondeterministic; legacy seeds, paths, and
+algorithm choices remain unchanged.

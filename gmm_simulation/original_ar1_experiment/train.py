@@ -26,6 +26,12 @@ from unconditional_model import UnconditionalDenoiser
 from utils import append_row_to_csv, describe_device, ensure_dir, get_device, save_json, set_seed, stable_hash
 
 
+LEGACY_MODEL_TYPES = ("unconditional", "conditional")
+NEW_MODEL_TYPE = "target_only_conditional"
+ALL_MODEL_TYPES = (*LEGACY_MODEL_TYPES, NEW_MODEL_TYPE)
+TARGET_ONLY_CONDITIONAL_SEED_OFFSET = 90_031
+
+
 class ConditionalBatchSampler:
     def __init__(self, x: np.ndarray, y: np.ndarray, K: int, mode: str, device: torch.device) -> None:
         self.x = torch.as_tensor(x, dtype=torch.float32, device=device)
@@ -144,6 +150,76 @@ def train_model(
     return model, log_df, ckpt_path, final_loss, val_mse
 
 
+def train_target_only_conditional(
+    model: ConditionalDenoiser,
+    diffusion: DDPM,
+    train_x: np.ndarray,
+    val_x: np.ndarray,
+    cfg: ExperimentConfig,
+    target_index: int,
+) -> tuple[torch.nn.Module, pd.DataFrame, Path, float, float]:
+    """Train the additive fixed-label conditional control without a class sampler."""
+    device = diffusion.device
+    model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.training.learning_rate)
+    sid = setting_id(cfg, NEW_MODEL_TYPE)
+    ckpt_path = cfg.checkpoint_dir / sid / f"{NEW_MODEL_TYPE}_last.pt"
+    log_path = cfg.log_dir / f"{sid}_{NEW_MODEL_TYPE}_train_log.csv"
+    ensure_dir(ckpt_path.parent)
+    ensure_dir(log_path.parent)
+    start_step = 0
+    rows: list[dict[str, float]] = []
+    if cfg.training.resume_from_checkpoint and ckpt_path.exists():
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_step = int(ckpt.get("step", 0))
+        if log_path.exists():
+            rows = pd.read_csv(log_path).to_dict("records")
+    target_x = torch.as_tensor(train_x, dtype=torch.float32, device=device)
+    final_loss = float("nan")
+    val_mse = float("nan")
+    if start_step < cfg.training.training_steps:
+        bar = trange(start_step, cfg.training.training_steps,
+                     desc=f"train {NEW_MODEL_TYPE}", leave=False)
+        for step in bar:
+            model.train()
+            idx = torch.randint(0, len(target_x), (cfg.training.batch_size,), device=device)
+            xb = target_x[idx]
+            labels = torch.full((len(xb),), target_index, dtype=torch.long, device=device)
+            loss = diffusion.epsilon_loss(model, xb, labels)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            final_loss = float(loss.item())
+            if (step + 1) % cfg.training.validation_interval == 0 or step + 1 == cfg.training.training_steps:
+                val_mse = validation_epsilon_mse(
+                    model, diffusion, val_x, conditional_label=target_index,
+                    batch_size=cfg.training.batch_size)
+                rows.append({"step": step + 1, "train_loss": final_loss,
+                             "validation_epsilon_mse": val_mse})
+                pd.DataFrame(rows).to_csv(log_path, index=False)
+                bar.set_postfix(loss=final_loss, val=val_mse)
+            if cfg.training.save_checkpoints and (
+                (step + 1) % cfg.training.checkpoint_interval == 0
+                or step + 1 == cfg.training.training_steps
+            ):
+                torch.save({"model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "step": step + 1}, ckpt_path)
+    elif log_path.exists():
+        existing_log = pd.read_csv(log_path)
+        if len(existing_log):
+            final_loss = float(existing_log.iloc[-1]["train_loss"])
+            val_mse = float(existing_log.iloc[-1]["validation_epsilon_mse"])
+    log_df = pd.DataFrame(rows) if rows else (
+        pd.read_csv(log_path) if log_path.exists() else pd.DataFrame())
+    if len(log_df):
+        final_loss = float(log_df.iloc[-1]["train_loss"])
+        val_mse = float(log_df.iloc[-1]["validation_epsilon_mse"])
+    return model, log_df, ckpt_path, final_loss, val_mse
+
+
 def _build_split(cfg: ExperimentConfig, spec):
     if cfg.experiment_type in {"smoke", "low_target_data"}:
         return build_low_target_data_split(spec, cfg.n_target_train or 100, cfg.n_aux_train or 1000, cfg.evaluation.n_test_target, cfg.seed)
@@ -175,7 +251,11 @@ def _existing_metric_mask(existing: pd.DataFrame, cfg: ExperimentConfig, model_t
     return mask
 
 
-def run_single_setting(cfg: ExperimentConfig, force: bool = False) -> pd.DataFrame:
+def run_single_setting(
+    cfg: ExperimentConfig,
+    force: bool = False,
+    model_types: tuple[str, ...] = LEGACY_MODEL_TYPES,
+) -> pd.DataFrame:
     set_seed(cfg.seed)
     device = get_device(cfg.training.device)
     for path in [cfg.results_dir, cfg.figure_dir, cfg.checkpoint_dir, cfg.config_dir, cfg.log_dir, cfg.sample_dir]:
@@ -198,8 +278,19 @@ def run_single_setting(cfg: ExperimentConfig, force: bool = False) -> pd.DataFra
     split = _build_split(cfg, spec)
     diffusion = DDPM(cfg.diffusion, device)
     rows = []
-    save_json(config_to_dict(cfg), cfg.config_dir / f"{stable_hash([cfg.experiment_type, cfg.seed, cfg.n, cfg.n_target_train, cfg.data.covariance_scenario, cfg.data.rho, cfg.data.mismatch_level])}.json")
+    config_stem = stable_hash([cfg.experiment_type, cfg.seed, cfg.n,
+                               cfg.n_target_train, cfg.data.covariance_scenario,
+                               cfg.data.rho, cfg.data.mismatch_level])
+    if any(model in model_types for model in LEGACY_MODEL_TYPES):
+        # Preserve the exact legacy config write on every historical command.
+        save_json(config_to_dict(cfg), cfg.config_dir / f"{config_stem}.json")
+    else:
+        additive_config = cfg.config_dir / f"{config_stem}_{NEW_MODEL_TYPE}.json"
+        if not additive_config.exists():
+            save_json(config_to_dict(cfg), additive_config)
     for model_type in ["unconditional", "conditional"]:
+        if model_type not in model_types:
+            continue
         sid = setting_id(cfg, model_type)
         if not force and len(existing) and _existing_metric_mask(existing, cfg, model_type).any():
             continue
@@ -249,7 +340,79 @@ def run_single_setting(cfg: ExperimentConfig, force: bool = False) -> pd.DataFra
         }
         append_row_to_csv(row, metrics_path, RESULT_COLUMNS)
         rows.append(row)
+    if NEW_MODEL_TYPE in model_types:
+        model_type = NEW_MODEL_TYPE
+        sid = setting_id(cfg, model_type)
+        if force or not len(existing) or not _existing_metric_mask(existing, cfg, model_type).any():
+            # This seed is set only after every selected legacy call has completed.
+            set_seed(cfg.seed + TARGET_ONLY_CONDITIONAL_SEED_OFFSET)
+            model = ConditionalDenoiser(
+                cfg.data.d, cfg.data.K, cfg.model.time_embedding_dim,
+                cfg.model.class_embedding_dim, cfg.model.hidden_width,
+                cfg.model.hidden_layers)
+            model, _, ckpt_path, final_loss, val_mse = train_target_only_conditional(
+                model, diffusion, split["uncond_train_x"], split["target_val_x"],
+                cfg, spec.target_index)
+            score_risk = estimate_score_risk(
+                model, diffusion, spec.means[spec.target_index],
+                spec.covariances[spec.target_index],
+                cfg.evaluation.score_risk_mc_samples,
+                conditional_label=spec.target_index,
+                batch_size=cfg.training.batch_size, seed=cfg.seed + 50)
+            labels = torch.tensor([spec.target_index], dtype=torch.long, device=device)
+            gen = diffusion.sample(
+                model, cfg.evaluation.n_generated, cfg.data.d, labels=labels,
+                batch_size=cfg.training.batch_size).numpy()
+            if cfg.evaluation.save_samples:
+                sample_prefix = common_setting_id(cfg)
+                np.save(cfg.sample_dir / f"{sample_prefix}_{model_type}_samples.npy", gen)
+            gm = generated_metrics(
+                gen, split["target_test_x"], spec.means[spec.target_index],
+                spec.covariances[spec.target_index], cfg.evaluation.mmd_max_samples,
+                cfg.seed)
+            row = {
+                "experiment_type": cfg.experiment_type,
+                "covariance_scenario": cfg.data.covariance_scenario,
+                "rho": cfg.data.rho,
+                "mismatch_level": cfg.data.mismatch_level,
+                "target_rho": spec.rhos[spec.target_index],
+                "auxiliary_rhos": ";".join(
+                    f"{r:.12g}" for i, r in enumerate(spec.rhos)
+                    if i != spec.target_index),
+                "sqrt_alpha_bar_T": sqrt_alpha_bar_T(cfg.diffusion),
+                "K": cfg.data.K, "d": cfg.data.d, "Delta": cfg.data.Delta,
+                "n": cfg.n, "n_target_train": cfg.n_target_train,
+                "n_aux_train": cfg.n_aux_train, "seed": cfg.seed,
+                "model_type": model_type,
+                "sampling_mode": cfg.training.sampling_mode,
+                "training_steps": cfg.training.training_steps,
+                "score_risk": score_risk,
+                "validation_epsilon_mse": val_mse,
+                "mean_error": gm["mean_error"],
+                "covariance_error": gm["covariance_error"],
+                "gaussian_w2_squared": gm["gaussian_w2_squared"],
+                "mmd_rbf": gm["mmd_rbf"],
+                "final_train_loss": final_loss,
+                "checkpoint_path": str(ckpt_path),
+                "figure_dir": str(cfg.figure_dir),
+            }
+            append_row_to_csv(row, metrics_path, RESULT_COLUMNS)
+            rows.append(row)
     return pd.DataFrame(rows)
+
+
+def normalize_model_types(values: list[str] | None) -> tuple[str, ...]:
+    if values is None:
+        return LEGACY_MODEL_TYPES
+    if "all" in values:
+        if len(values) != 1:
+            raise ValueError("--model-types all cannot be combined with other values")
+        return ALL_MODEL_TYPES
+    unknown = set(values) - set(ALL_MODEL_TYPES)
+    if unknown:
+        raise ValueError(f"Unsupported --model-types: {sorted(unknown)}")
+    selected = set(values)
+    return tuple(model for model in ALL_MODEL_TYPES if model in selected)
 
 
 def build_cli_configs(args: argparse.Namespace) -> list[ExperimentConfig]:
@@ -292,15 +455,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--save-samples", action="store_true")
+    parser.add_argument(
+        "--model-types", nargs="+",
+        choices=[*ALL_MODEL_TYPES, "all"],
+        help="Models to execute. Omitted preserves the legacy unconditional-then-conditional run.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     describe_device()
+    selected = normalize_model_types(args.model_types)
+    configs = build_cli_configs(args)
     frames = []
-    for cfg in build_cli_configs(args):
-        frames.append(run_single_setting(cfg, force=args.force))
+    legacy_selected = tuple(model for model in LEGACY_MODEL_TYPES if model in selected)
+    if legacy_selected:
+        for cfg in configs:
+            frames.append(run_single_setting(cfg, force=args.force,
+                                             model_types=legacy_selected))
+    if NEW_MODEL_TYPE in selected:
+        for cfg in configs:
+            frames.append(run_single_setting(cfg, force=args.force,
+                                             model_types=(NEW_MODEL_TYPE,)))
     if frames:
         print(pd.concat(frames, ignore_index=True) if any(len(f) for f in frames) else "No new settings were run.")
 

@@ -11,6 +11,13 @@ The comparison is between:
 1. **Target-only unconditional DDPM**: trained only on Gaussian component/class 1 and modeled by `epsilon_theta(x_t, t)`.
 2. **Multi-class conditional DDPM**: trained on all components/classes and sampled/evaluated only at target label `c = 1`, modeled by `epsilon_theta(x_t, t, c)`.
 
+An additive third estimator is now available without changing either historical
+model: **target-only conditional control** (`model_type=target_only_conditional`).
+It uses the existing full `K`-class `ConditionalDenoiser`, receives the target
+label for every training/evaluation example, and trains on exactly the same
+target rows as the unconditional model. Thus the mappings are
+`U_T=unconditional`, `C_T=target_only_conditional`, and `C_J=conditional`.
+
 Both models use the same original DDPM epsilon-prediction objective, forward process, linear beta schedule, and reverse sampling equations. They differ only in training data and whether the MLP receives a learned class embedding.
 
 ## Repository structure
@@ -146,6 +153,57 @@ python train.py --experiment same_total_budget --training-steps 20000 --resume
 python train.py --experiment all --training-steps 20000 --resume
 ```
 
+The command above remains a legacy two-model run. To train only the additive
+`C_T` rows, without constructing, loading, evaluating, or overwriting either old
+model, run:
+
+```bash
+python train.py --experiment all \
+  --model-types target_only_conditional \
+  --seeds 0 1 2 3 4 \
+  --results-dir <EXISTING_RESULTS_DIR> \
+  --resume
+```
+
+Use `--model-types all` to run all three. All selected legacy calls finish in
+their historical `unconditional`, `conditional` order before any new control
+call begins. In the same-total-budget experiment, both `U_T` and `C_T` use the
+same `K*n` target observations; in the low-target-data experiment both use the
+same `n_target_train` observations.
+
+Three-model paired analysis is additive and does not change the historical plot
+outputs:
+
+```bash
+python analyze_three_models.py --results-dir <EXISTING_RESULTS_DIR>
+```
+
+It writes `paired_three_model_gaps.csv`, `summary_three_model_gaps.csv`, a LaTeX
+table, and separate score/W2 gap figures for `low_target_data` and
+`same_total_budget`. Comparisons are paired by seed and complete scientific
+setting before averaging. The paired CSV retains each seed's realized
+`auxiliary_rhos` for auditability; the cross-seed summary excludes that realized
+field and groups class-varying designs by `mismatch_level`. Thus all expected
+seeds for one mismatch level contribute to the same summary group.
+
+The four formal figures are:
+
+```text
+figures/low_target_data_three_model_score_gaps.png
+figures/low_target_data_three_model_w2_gaps.png
+figures/same_total_budget_three_model_score_gaps.png
+figures/same_total_budget_three_model_w2_gaps.png
+```
+
+Curves are separated by comparison, covariance scenario, and covariance setting
+(`rho=<value>` or `mismatch=<level>`). Error bars use the paired Student-t 95%
+intervals stored in the summary, not a normal approximation. `C_J-U_T` is the
+primary paper comparison,
+`C_J-C_T` is the architecture-matched auxiliary-training comparison, and
+`C_T-U_T` is the architecture/parameterization gap. A negative gap favors the
+first model. Missing `C_T` rows leave the historical `C_J-U_T` comparison
+available while the two control-dependent comparisons are marked incomplete.
+
 An optional extended run can use `--training-steps 50000` if results are unstable or inconclusive.
 
 ## Generating plots
@@ -175,6 +233,27 @@ results_T1000_K3/configs/
 Use `--resume` to continue from saved checkpoints and skip settings that already have final metrics. Partial CSV rows are appended after each trained model/setting so that completed work is not lost if a Colab runtime disconnects.
 
 Use `--force` to rerun settings even if matching metrics already exist.
+
+Existing `unconditional` and `conditional` checkpoint IDs, paths, metric rows,
+and default execution order are unchanged, so they do not need retraining. The
+new `C_T` is architecture-matched and seed-paired to the scientific setting,
+using a deterministic model-specific seed after legacy calls. Historical `C_J`
+checkpoints did not save their pre-training initialization, so `C_T` is **not**
+claimed to be identical-initialization-matched to historical `C_J`.
+
+The exact historical-reproduction guarantee applies to commands that existed
+before this extension, notably commands that omit `--model-types`. A new subset
+command such as `--model-types conditional` skips the RNG consumed by the
+historically preceding unconditional run and therefore is not claimed to match
+the old sequential checkpoint. Exact numerical regression is required in the
+same CPU environment and dependency versions. GPU/CUDA library nondeterminism
+precludes a claim of bitwise equality across hardware, CUDA, or PyTorch versions;
+the legacy GPU code path, seeds, and algorithm selection remain unchanged.
+
+The Original module has its own hosted `gmm-original-ar1-tests` CI job. To
+reproduce the base-versus-head tiny CPU golden comparison, use the versioned
+runner documented in `gmm_simulation/README.md`; no `/tmp`-only helper or saved
+baseline artifact is required.
 
 ## Google Colab instructions
 

@@ -68,7 +68,7 @@ def checkpoint_id(training_design_identifier: str, seed: int, model_type: str,
         if rotation_deg is None:
             raise ValueError("joint_conditional checkpoint requires rotation_deg")
         payload["rotation_deg"] = int(rotation_deg)
-    elif model_type != "target_only":
+    elif model_type not in {"target_only", "unconditional"}:
         raise ValueError(f"Unknown model_type={model_type!r}")
     return canonical_hash(payload)
 
@@ -80,7 +80,7 @@ def setting_id(pair_identifier: str, model_type: str,
         if rotation_deg is None:
             raise ValueError("joint_conditional setting requires rotation_deg")
         payload["rotation_deg"] = int(rotation_deg)
-    elif model_type != "target_only":
+    elif model_type not in {"target_only", "unconditional"}:
         raise ValueError(f"Unknown model_type={model_type!r}")
     return canonical_hash(payload)
 
