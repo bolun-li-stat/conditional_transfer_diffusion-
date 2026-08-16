@@ -1,0 +1,22 @@
+target_set_id: french_bulldog_primary_fixed3_v1
+target_set_version: "1.0"
+reviewed: true
+frozen: true
+reviewer: Bolun Li
+review_date: "2026-08-16"
+targets:
+  - name: French bulldog
+    synset: n02108915
+    primary_target: true
+    supercategory: dog
+    selection_rationale: >-
+      The close dog breeds provide the endpoint most favorable to positive
+      transfer. Medium preserves quadruped-mammal or carnivore structure while
+      moving beyond fine-grained dog breeds. Far uses human-made objects with
+      clearly different semantics and visual structure as an extreme mismatch.
+      The close and far endpoints are run; medium is frozen for future study but
+      is not run in the reduced primary-protocol grid.
+    auxiliary_sets:
+      close: [n02096585, n02110958, n02108089]
+      medium: [n02123045, n02119022, n02114367]
+      far: [n04146614, n03028079, n04398044]
