@@ -1,0 +1,70 @@
+target_set_id: reduced_main_4targets_v1
+target_set_version: "1.0"
+reviewed: true
+frozen: true
+reviewer: Bolun Li
+review_date: "2026-08-16"
+targets:
+  - name: French bulldog
+    synset: n02108915
+    supercategory: dog
+    selection_rationale: >-
+      The close classes are highly similar dog breeds and provide the condition
+      most favorable to positive transfer. The medium classes preserve
+      quadruped-mammal or carnivore structure while moving beyond fine-grained
+      dog breeds. The far classes are human-made objects with clearly different
+      semantics, morphology, and visual structure. The strong close-versus-far
+      contrast is intentional in this reduced experiment. Medium is frozen for
+      a future finer similarity-gradient experiment but is not run here.
+    auxiliary_sets:
+      close: [n02096585, n02110958, n02108089]
+      medium: [n02123045, n02119022, n02114367]
+      far: [n04146614, n03028079, n04398044]
+
+  - name: jay
+    synset: n01580077
+    supercategory: bird
+    selection_rationale: >-
+      The close classes share relatively similar bird silhouettes, feather
+      textures, body sizes, or habitat scenes. The medium classes remain birds
+      but differ substantially in size, posture, bill shape, color, and niche.
+      The far classes are vehicle, vessel, and fungus categories wholly unlike
+      birds. Far is an extreme mismatch condition rather than a gradual change
+      within one semantic level. Medium is recorded and frozen but does not
+      enter the reduced grid.
+    auxiliary_sets:
+      close: [n01537544, n01582220, n01592084]
+      medium: [n01518878, n01614925, n01860187]
+      far: [n04146614, n04398044, n07734744]
+
+  - name: jeep
+    synset: n03594945
+    supercategory: vehicle
+    selection_rationale: >-
+      The close classes are related road passenger or utility vehicles. The
+      medium classes remain in the transportation or vehicle domain while
+      spanning air, surface-water, and underwater transport. The far classes
+      are an animal, a vessel, and a building with entirely different semantics
+      and morphology. Close and far form positive-transfer-favorable and
+      extreme-mismatch endpoints. Medium is frozen in advance but is not run
+      in this reduced experiment.
+    auxiliary_sets:
+      close: [n02814533, n03770679, n03930630]
+      medium: [n02690373, n02951358, n04347754]
+      far: [n01443537, n04398044, n03028079]
+
+  - name: acoustic guitar
+    synset: n02676566
+    supercategory: musical_instrument
+    selection_rationale: >-
+      The close classes share strings, necks, wooden resonant bodies, or closely
+      related instrument structure. The medium classes remain musical
+      instruments but come from reed or keyboard, brass, and percussion
+      families. The far classes are an animal, a vehicle, and a fungus, all
+      unlike musical instruments. Far deliberately creates an extreme mismatch
+      to improve the chance of observing negative transfer. Medium is recorded
+      and frozen but does not enter the reduced grid.
+    auxiliary_sets:
+      close: [n03272010, n02787622, n02992211]
+      medium: [n02672831, n03394916, n03249569]
+      far: [n01443537, n04146614, n07734744]

@@ -1,0 +1,37 @@
+target_set_id: french_bulldog_k_sensitivity_v1
+target_set_version: "1.0"
+reviewed: true
+frozen: true
+reviewer: Bolun Li
+review_date: "2026-08-16"
+targets:
+  - name: French bulldog
+    synset: n02108915
+    primary_target: true
+    supercategory: dog
+    selection_rationale: >-
+      Close contains dog breeds at different degrees of similarity. Medium
+      remains within quadruped mammals or carnivores but moves beyond dog
+      breeds. Far contains vehicles, buildings, and human-made objects as an
+      extreme mismatch. This K-sensitivity experiment runs only close and far;
+      medium is defined and frozen but is not included in the current grid.
+    auxiliary_sets:
+      close:
+        - n02096585
+        - n02110958
+        - n02108089
+        - n02085620
+        - n02091032
+        - n02099601
+      medium:
+        - n02123045
+        - n02123159
+        - n02124075
+        - n02119022
+        - n02114367
+      far:
+        - n03594945
+        - n04146614
+        - n03028079
+        - n03457902
+        - n03710193
